@@ -96,7 +96,9 @@ def test_processes_success_failure_and_skips_as_structured_receipts(caplog) -> N
     success_request = next(
         request for request in requests if request.url.path == "/cancel"
     )
-    assert str(success_request.url) == "https://remediation.example:8443/cancel"
+    assert success_request.url.username == "api-user"
+    assert success_request.url.password == "api-password"
+    assert success_request.url.query == b"api_key=private-query"
     assert json.loads(success_request.content) == {
         "incident_id": "INC-9942",
         "target_urn": "urn:li:dataJob:success",

@@ -73,9 +73,12 @@ class CompensatingActionEngine:
         }
 
         try:
-            # Only the normalized endpoint is sent to the client, keeping URL
-            # credentials, query values, and fragments out of HTTP client logs.
-            response = await self.http_client.post(endpoint, json=payload)
+            # Execute the configured endpoint unchanged so authenticated or
+            # query-routed webhooks retain their semantics. This module never
+            # logs it and persists only the sanitized endpoint above.
+            response = await self.http_client.post(
+                target.remediation_webhook, json=payload
+            )
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
             http_status = exc.response.status_code
