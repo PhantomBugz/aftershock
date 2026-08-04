@@ -301,7 +301,7 @@ git commit -m "feat: expose honest MCP incident workflow"
 
 - [ ] **Step 1: Write failing bootstrap contract tests**
 
-Assert the structured-property YAML declares `aftershock.businessAction` and `aftershock.remediationWebhook` as single string properties for DataJob, Dataset, and MLModel entity types. Assert bootstrap dry-run output includes all demo URNs and no token values.
+Assert the structured-property YAML declares `aftershock.businessAction` and `aftershock.remediationWebhook` as single string properties for DataJob and MLModel entity types. Dataset is deliberately excluded because it is the incident source, not a compensating-control target. Assert bootstrap dry-run output includes all demo URNs and no token values.
 
 - [ ] **Step 2: Run the bootstrap test and verify RED**
 

@@ -1,0 +1,19 @@
+- id: aftershock.businessAction
+  qualified_name: aftershock.businessAction
+  type: string
+  cardinality: SINGLE
+  display_name: Business Action
+  description: Stable business action identifier for this asset.
+  entity_types:
+    - urn:li:entityType:datahub.dataJob
+    - urn:li:entityType:datahub.mlModel
+
+- id: aftershock.remediationWebhook
+  qualified_name: aftershock.remediationWebhook
+  type: string
+  cardinality: SINGLE
+  display_name: Remediation Webhook
+  description: Absolute HTTP or HTTPS endpoint used to initiate remediation.
+  entity_types:
+    - urn:li:entityType:datahub.dataJob
+    - urn:li:entityType:datahub.mlModel

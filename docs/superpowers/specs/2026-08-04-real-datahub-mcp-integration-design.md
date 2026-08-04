@@ -75,7 +75,7 @@ The mapper will accept the official MCP entity response shapes and normalize the
 
 ```json
 {
-  "urn": "urn:li:dataJob:(urn:li:dataFlow:airflow,purchase_order_generator,PROD)",
+  "urn": "urn:li:dataJob:(urn:li:dataFlow:(airflow,aftershock_demo,PROD),purchase_order_generator)",
   "entity_type": "DATA_JOB",
   "business_action": "ISSUE_PO",
   "remediation_webhook": "https://api.internal.example/remediate/cancel_po"
@@ -106,6 +106,11 @@ The HTTP request body remains:
   "business_action": "ISSUE_PO"
 }
 ```
+
+Each request also includes an opaque, deterministic `Idempotency-Key` header
+derived from the incident ID, target URN, and business action. Downstream
+services can therefore deduplicate retries without Aftershock exposing those
+values in the header itself.
 
 ## MCP Write-Back
 

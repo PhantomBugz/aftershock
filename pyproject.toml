@@ -9,7 +9,7 @@ description = "Data incident response from DataHub lineage to compensating actio
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-  "acryl-datahub>=1.3,<2",
+  "acryl-datahub==1.6.0.17",
   "fastapi>=0.111,<1",
   "fastmcp==3.4.5",
   "httpx>=0.28,<1",
@@ -30,3 +30,9 @@ where = ["src"]
 addopts = "-ra"
 pythonpath = ["src"]
 testpaths = ["tests"]
+markers = [
+  "live_datahub: opt-in contract tests against a real seeded DataHub instance through MCP",
+]
+filterwarnings = [
+  "ignore:The new datahub SDK .*:datahub.errors.ExperimentalWarning",
+]
