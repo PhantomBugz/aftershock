@@ -1,0 +1,31 @@
+{
+  "data": {
+    "dataset": {
+      "urn": "urn:li:dataset:(urn:li:dataPlatform:postgres,inventory_pricing,PROD)",
+      "downstreamLineage": {
+        "entities": [
+          {
+            "entity": {
+              "urn": "urn:li:dataJob:(urn:li:dataFlow:airflow,purchase_order_generator,PROD)",
+              "type": "DATA_JOB",
+              "customProperties": {
+                "business_action": "ISSUE_PO",
+                "remediation_webhook": "https://api.internal.corp/remediate/cancel_po"
+              }
+            }
+          },
+          {
+            "entity": {
+              "urn": "urn:li:mlModel:(urn:li:dataPlatform:sagemaker,dynamic_pricing_model,PROD)",
+              "type": "ML_MODEL",
+              "customProperties": {
+                "business_action": "ADJUST_PRICE",
+                "remediation_webhook": "https://api.internal.corp/remediate/revert_pricing"
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}
