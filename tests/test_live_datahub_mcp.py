@@ -27,9 +27,12 @@ pytestmark = [
     ),
 ]
 
-DATASET_URN = "urn:li:dataset:(urn:li:dataPlatform:postgres,inventory_pricing,PROD)"
+DATASET_URN = (
+    "urn:li:dataset:(urn:li:dataPlatform:postgres,"
+    "aftershock_demo.inventory_pricing,DEV)"
+)
 JOB_URN = (
-    "urn:li:dataJob:(urn:li:dataFlow:(airflow,aftershock_demo,PROD),"
+    "urn:li:dataJob:(urn:li:dataFlow:(airflow,aftershock_demo,DEV),"
     "purchase_order_generator)"
 )
 DOCUMENT_URN = "urn:li:document:aftershock-live-contract-test"

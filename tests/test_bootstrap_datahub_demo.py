@@ -15,16 +15,20 @@ import pytest
 from datahub.api.entities.structuredproperties.structuredproperties import (
     StructuredProperties,
 )
+from datahub.errors import ItemNotFoundError
 from datahub.ingestion.graph.config import DatahubClientConfig
 from datahub.sdk import DataFlow, DataJob, Dataset
 
 
 ROOT = Path(__file__).resolve().parents[1]
 PROPERTY_FILE = ROOT / "config" / "aftershock_structured_properties.yaml"
-DATASET_URN = "urn:li:dataset:(urn:li:dataPlatform:postgres,inventory_pricing,PROD)"
-FLOW_URN = "urn:li:dataFlow:(airflow,aftershock_demo,PROD)"
+DATASET_URN = (
+    "urn:li:dataset:(urn:li:dataPlatform:postgres,"
+    "aftershock_demo.inventory_pricing,DEV)"
+)
+FLOW_URN = "urn:li:dataFlow:(airflow,aftershock_demo,DEV)"
 JOB_URN = (
-    "urn:li:dataJob:(urn:li:dataFlow:(airflow,aftershock_demo,PROD),"
+    "urn:li:dataJob:(urn:li:dataFlow:(airflow,aftershock_demo,DEV),"
     "purchase_order_generator)"
 )
 BUSINESS_ACTION_PROPERTY_URN = (
@@ -130,6 +134,7 @@ def test_dry_run_is_deterministic_and_never_constructs_a_client_or_leaks_token()
     assert first == second
     assert first == {
         "mode": "dry-run",
+        "target_origin": "not configured",
         "definitions_command": [
             "datahub",
             "properties",
@@ -149,6 +154,57 @@ def test_dry_run_is_deterministic_and_never_constructs_a_client_or_leaks_token()
     assert calls == []
 
 
+@pytest.mark.parametrize(
+    ("configured_url", "expected_origin"),
+    [
+        ("http://LOCALHOST/path?token=QUERY-SECRET", "http://localhost:80"),
+        ("https://Example.COM:8443/api/graphql?token=QUERY-SECRET", "https://example.com:8443"),
+        ("http://[::1]/api", "http://[::1]:80"),
+    ],
+)
+def test_dry_run_reports_only_canonical_target_origin(
+    configured_url: str,
+    expected_origin: str,
+) -> None:
+    bootstrap = _bootstrap_module()
+
+    result = bootstrap.execute_bootstrap(
+        mode="dry-run",
+        environ={
+            "DATAHUB_GMS_URL": configured_url,
+            "DATAHUB_GMS_TOKEN": "HEADER-SECRET",
+        },
+        client_factory=lambda **kwargs: pytest.fail(
+            "dry-run must not construct a client"
+        ),
+    )
+
+    assert result["target_origin"] == expected_origin
+    serialized = json.dumps(result, sort_keys=True)
+    assert "QUERY-SECRET" not in serialized
+    assert "HEADER-SECRET" not in serialized
+    assert "/path" not in serialized
+    assert "/api/graphql" not in serialized
+
+
+def test_dry_run_never_echoes_unsafe_userinfo_or_fragment() -> None:
+    bootstrap = _bootstrap_module()
+
+    for configured_url, secret in (
+        ("https://username:USERINFO-SECRET@example.com:8443/path", "USERINFO-SECRET"),
+        ("https://example.com:8443/path#FRAGMENT-SECRET", "FRAGMENT-SECRET"),
+    ):
+        result = bootstrap.execute_bootstrap(
+            mode="dry-run",
+            environ={"DATAHUB_GMS_URL": configured_url},
+            client_factory=lambda **kwargs: pytest.fail(
+                "dry-run must not construct a client"
+            ),
+        )
+        assert result["target_origin"] == "invalid or unsafe configuration"
+        assert secret not in json.dumps(result, sort_keys=True)
+
+
 def test_apply_requires_nonblank_gms_url_before_definitions_or_client() -> None:
     bootstrap = _bootstrap_module()
     events: list[str] = []
@@ -164,8 +220,70 @@ def test_apply_requires_nonblank_gms_url_before_definitions_or_client() -> None:
         bootstrap.execute_bootstrap(
             mode="apply",
             environ={"DATAHUB_GMS_URL": "   "},
+            confirm_target="http://localhost:8080",
             client_factory=client_factory,
             definitions_runner=definitions_runner,
+        )
+
+    assert events == []
+
+
+@pytest.mark.parametrize(
+    "configured_url",
+    [
+        "ftp://localhost:8080",
+        "http://operator:secret@localhost:8080",
+        "http://localhost:8080/#secret-fragment",
+        "http://localhost:8080/path#",
+        "http:///missing-host",
+    ],
+)
+def test_apply_rejects_unsafe_target_before_definitions_or_client(
+    configured_url: str,
+) -> None:
+    bootstrap = _bootstrap_module()
+    events: list[str] = []
+
+    with pytest.raises(ValueError, match="DATAHUB_GMS_URL is invalid or unsafe"):
+        bootstrap.execute_bootstrap(
+            mode="apply",
+            environ={"DATAHUB_GMS_URL": configured_url},
+            confirm_target="http://localhost:8080",
+            client_factory=lambda **kwargs: events.append("client"),
+            definitions_runner=lambda *args, **kwargs: events.append("definitions"),
+        )
+
+    assert events == []
+
+
+def test_apply_requires_exact_canonical_target_confirmation_before_any_work() -> None:
+    bootstrap = _bootstrap_module()
+    events: list[str] = []
+
+    for confirmation in (None, "http://localhost:80", "http://LOCALHOST:8080"):
+        with pytest.raises(ValueError, match="target confirmation does not match"):
+            bootstrap.execute_bootstrap(
+                mode="apply",
+                environ={"DATAHUB_GMS_URL": "http://localhost:8080/api?secret=x"},
+                confirm_target=confirmation,
+                client_factory=lambda **kwargs: events.append("client"),
+                definitions_runner=lambda *args, **kwargs: events.append("definitions"),
+            )
+
+    assert events == []
+
+
+def test_apply_refuses_remote_target_without_explicit_override() -> None:
+    bootstrap = _bootstrap_module()
+    events: list[str] = []
+
+    with pytest.raises(ValueError, match="remote DataHub target requires"):
+        bootstrap.execute_bootstrap(
+            mode="apply",
+            environ={"DATAHUB_GMS_URL": "https://datahub.example:443/path"},
+            confirm_target="https://datahub.example:443",
+            client_factory=lambda **kwargs: events.append("client"),
+            definitions_runner=lambda *args, **kwargs: events.append("definitions"),
         )
 
     assert events == []
@@ -176,6 +294,10 @@ def test_apply_defines_properties_then_upserts_three_assets_and_one_exact_edge()
     events: list[tuple[str, Any]] = []
 
     class Entities:
+        def get(self, urn: str) -> object:
+            events.append(("preflight", urn))
+            raise ItemNotFoundError("not found")
+
         def upsert(self, entity: object) -> None:
             events.append(("upsert", entity))
 
@@ -207,19 +329,28 @@ def test_apply_defines_properties_then_upserts_three_assets_and_one_exact_edge()
             "DATAHUB_GMS_URL": "http://localhost:8080",
             "DATAHUB_GMS_TOKEN": "DO-NOT-PRINT-ME",
         },
+        confirm_target="http://localhost:8080",
         client_factory=client_factory,
         definitions_runner=definitions_runner,
     )
 
     assert [event[0] for event in events] == [
-        "definitions",
         "client",
+        "preflight",
+        "preflight",
+        "preflight",
+        "definitions",
         "upsert",
         "upsert",
         "upsert",
         "lineage",
     ]
-    assert events[0][1] == {
+    assert [event[1] for event in events[1:4]] == [
+        DATASET_URN,
+        FLOW_URN,
+        JOB_URN,
+    ]
+    assert events[4][1] == {
         "command": (
             "datahub",
             "properties",
@@ -229,7 +360,7 @@ def test_apply_defines_properties_then_upserts_three_assets_and_one_exact_edge()
         ),
         "url": "http://localhost:8080",
     }
-    client_kwargs = events[1][1]
+    client_kwargs = events[0][1]
     assert set(client_kwargs) == {"config"}
     client_config = client_kwargs["config"]
     assert isinstance(client_config, DatahubClientConfig)
@@ -261,6 +392,150 @@ def test_apply_defines_properties_then_upserts_three_assets_and_one_exact_edge()
     assert "mlModel" not in serialized
 
 
+def test_apply_remote_override_allows_confirmed_target() -> None:
+    bootstrap = _bootstrap_module()
+
+    class Entities:
+        def get(self, urn: str) -> object:
+            raise ItemNotFoundError("not found")
+
+        def upsert(self, entity: object) -> None:
+            return None
+
+    class Lineage:
+        def add_lineage(self, **kwargs: object) -> None:
+            return None
+
+    class Client:
+        entities = Entities()
+        lineage = Lineage()
+
+    result = bootstrap.execute_bootstrap(
+        mode="apply",
+        environ={"DATAHUB_GMS_URL": "https://datahub.example/api?token=secret"},
+        confirm_target="https://datahub.example:443",
+        allow_remote_target=True,
+        client_factory=lambda **kwargs: Client(),
+        definitions_runner=lambda *args, **kwargs: None,
+    )
+
+    assert result["target_origin"] == "https://datahub.example:443"
+
+
+def test_apply_refuses_existing_assets_before_any_mutation() -> None:
+    bootstrap = _bootstrap_module()
+    events: list[tuple[str, Any]] = []
+
+    class Entities:
+        def get(self, urn: str) -> object:
+            events.append(("preflight", urn))
+            if urn == FLOW_URN:
+                return object()
+            raise ItemNotFoundError("not found")
+
+        def upsert(self, entity: object) -> None:
+            events.append(("upsert", entity))
+
+    class Client:
+        entities = Entities()
+
+    with pytest.raises(
+        RuntimeError,
+        match="^DataHub demo asset collision detected$",
+    ):
+        bootstrap.execute_bootstrap(
+            mode="apply",
+            environ={"DATAHUB_GMS_URL": "http://localhost:8080"},
+            confirm_target="http://localhost:8080",
+            client_factory=lambda **kwargs: Client(),
+            definitions_runner=lambda *args, **kwargs: events.append(
+                ("definitions", None)
+            ),
+        )
+
+    assert events == [
+        ("preflight", DATASET_URN),
+        ("preflight", FLOW_URN),
+        ("preflight", JOB_URN),
+    ]
+
+
+def test_apply_existing_asset_override_is_explicit_idempotent_rerun() -> None:
+    bootstrap = _bootstrap_module()
+    events: list[tuple[str, Any]] = []
+
+    class Entities:
+        def get(self, urn: str) -> object:
+            events.append(("preflight", urn))
+            return object()
+
+        def upsert(self, entity: object) -> None:
+            events.append(("upsert", entity))
+
+    class Lineage:
+        def add_lineage(self, **kwargs: object) -> None:
+            events.append(("lineage", kwargs))
+
+    class Client:
+        entities = Entities()
+        lineage = Lineage()
+
+    bootstrap.execute_bootstrap(
+        mode="apply",
+        environ={"DATAHUB_GMS_URL": "http://127.0.0.1:8080"},
+        confirm_target="http://127.0.0.1:8080",
+        allow_existing_demo_assets=True,
+        client_factory=lambda **kwargs: Client(),
+        definitions_runner=lambda *args, **kwargs: events.append(
+            ("definitions", None)
+        ),
+    )
+
+    assert [event[0] for event in events] == [
+        "preflight",
+        "preflight",
+        "preflight",
+        "definitions",
+        "upsert",
+        "upsert",
+        "upsert",
+        "lineage",
+    ]
+
+
+def test_apply_wraps_collision_preflight_error_without_secret_detail(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    bootstrap = _bootstrap_module()
+    sentinel = "SECRET-PREFLIGHT-FAILURE"
+    events: list[str] = []
+
+    class Entities:
+        def get(self, urn: str) -> object:
+            raise RuntimeError(sentinel)
+
+    class Client:
+        entities = Entities()
+
+    with pytest.raises(
+        RuntimeError,
+        match="^DataHub demo asset collision preflight failed$",
+    ) as exc_info:
+        bootstrap.execute_bootstrap(
+            mode="apply",
+            environ={"DATAHUB_GMS_URL": "http://localhost:8080"},
+            confirm_target="http://localhost:8080",
+            client_factory=lambda **kwargs: Client(),
+            definitions_runner=lambda *args, **kwargs: events.append("definitions"),
+        )
+
+    assert sentinel not in str(exc_info.value)
+    assert events == []
+    captured = capsys.readouterr()
+    assert sentinel not in captured.out
+    assert sentinel not in captured.err
+
+
 def test_cli_requires_exactly_one_mode() -> None:
     bootstrap = _bootstrap_module()
     parser = bootstrap.build_parser()
@@ -271,7 +546,31 @@ def test_cli_requires_exactly_one_mode() -> None:
         parser.parse_args(["--dry-run", "--apply"])
 
     assert parser.parse_args(["--dry-run"]).dry_run is True
-    assert parser.parse_args(["--apply"]).apply is True
+    parsed_apply = parser.parse_args(
+        ["--apply", "--confirm-target", "http://localhost:8080"]
+    )
+    assert parsed_apply.apply is True
+    assert parsed_apply.confirm_target == "http://localhost:8080"
+    assert parsed_apply.allow_remote_target is False
+    assert parsed_apply.allow_existing_demo_assets is False
+
+
+def test_cli_accepts_explicit_remote_and_existing_asset_overrides() -> None:
+    bootstrap = _bootstrap_module()
+    parser = bootstrap.build_parser()
+
+    args = parser.parse_args(
+        [
+            "--apply",
+            "--confirm-target",
+            "https://datahub.example:443",
+            "--allow-remote-target",
+            "--allow-existing-demo-assets",
+        ]
+    )
+
+    assert args.allow_remote_target is True
+    assert args.allow_existing_demo_assets is True
 
 
 def test_definition_cli_has_a_hard_timeout_and_hides_timeout_output(
@@ -293,6 +592,13 @@ def test_definition_cli_has_a_hard_timeout_and_hides_timeout_output(
 
     monkeypatch.setattr(bootstrap.subprocess, "run", timed_out_run)
 
+    class Entities:
+        def get(self, urn: str) -> object:
+            raise ItemNotFoundError("not found")
+
+    class Client:
+        entities = Entities()
+
     with pytest.raises(RuntimeError) as exc_info:
         bootstrap.execute_bootstrap(
             mode="apply",
@@ -300,9 +606,8 @@ def test_definition_cli_has_a_hard_timeout_and_hides_timeout_output(
                 "DATAHUB_GMS_URL": "http://localhost:8080",
                 "DATAHUB_GMS_TOKEN": sentinel,
             },
-            client_factory=lambda **kwargs: pytest.fail(
-                "client must not be constructed after definition timeout"
-            ),
+            confirm_target="http://localhost:8080",
+            client_factory=lambda **kwargs: Client(),
         )
 
     assert observed["timeout"] == bootstrap.DEFINITION_CLI_TIMEOUT_SECONDS
@@ -333,6 +638,9 @@ def test_apply_wraps_each_third_party_failure_without_leaking_details(
     sentinel = f"SECRET-FAILURE-{failure_stage}"
 
     class Entities:
+        def get(self, urn: str) -> object:
+            raise ItemNotFoundError("not found")
+
         def upsert(self, entity: object) -> None:
             stage_by_type = {
                 Dataset: "dataset",
@@ -367,6 +675,7 @@ def test_apply_wraps_each_third_party_failure_without_leaking_details(
                 "DATAHUB_GMS_URL": "http://localhost:8080",
                 "DATAHUB_GMS_TOKEN": sentinel,
             },
+            confirm_target="http://localhost:8080",
             client_factory=client_factory,
             definitions_runner=definitions_runner,
         )
@@ -395,6 +704,7 @@ def test_apply_does_not_wrap_process_control_base_exceptions(
         bootstrap.execute_bootstrap(
             mode="apply",
             environ={"DATAHUB_GMS_URL": "http://localhost:8080"},
+            confirm_target="http://localhost:8080",
             client_factory=client_factory,
             definitions_runner=lambda *args, **kwargs: None,
         )
@@ -413,7 +723,9 @@ def test_cli_suppresses_unexpected_exception_details_and_tracebacks(
     monkeypatch.setattr(bootstrap, "execute_bootstrap", fail)
 
     with pytest.raises(SystemExit) as exc_info:
-        bootstrap.main(["--apply"])
+        bootstrap.main(
+            ["--apply", "--confirm-target", "http://localhost:8080"]
+        )
 
     assert exc_info.value.code == 2
     captured = capsys.readouterr()

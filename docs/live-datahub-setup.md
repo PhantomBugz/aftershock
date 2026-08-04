@@ -31,39 +31,50 @@ and confirm that MCP mutation tools are enabled.
 
 ## 3. Define and seed the demo metadata
 
-Configure the DataHub CLI for the target instance, then create the two exact
-structured properties used by the mapper:
-
-```powershell
-datahub properties upsert -f config\aftershock_structured_properties.yaml
-```
-
-Preview the seed plan before writing anything:
-
-```powershell
-python scripts\bootstrap_datahub_demo.py --dry-run
-```
-
-Review the printed target, URNs, property values, and lineage edge. Then apply
-the same plan:
+Configure the DataHub CLI for the target instance. Set the GMS URL before the
+preview so the plan can display the target origin. The preview strips paths,
+queries, user information, and credentials; it does not create a client or
+make a network call:
 
 ```powershell
 $env:DATAHUB_GMS_URL = "http://localhost:8080"
 Remove-Item Env:DATAHUB_GMS_TOKEN -ErrorAction SilentlyContinue
 # If the instance requires authentication, set its real token in this shell:
 # $env:DATAHUB_GMS_TOKEN = "replace-with-gms-token"
-python scripts\bootstrap_datahub_demo.py --apply
+python scripts\bootstrap_datahub_demo.py --dry-run
 ```
 
-The live bootstrap seeds a Postgres Dataset, an Airflow DataFlow/DataJob, the
-two remediation properties on the DataJob, and a Dataset-to-DataJob lineage
-edge. It deliberately does not manufacture Dataset-to-MLModel lineage. The
-offline fixture contains an explicitly labeled MLModel example only to exercise
-mixed target rendering and receipt handling.
+Review the printed canonical target origin, uniquely namespaced `DEV` URNs,
+property values, and lineage edge. Copy that origin exactly into the mandatory
+confirmation argument, including its port, and then apply the same plan:
 
-Use a remediation URL that points to a service you are authorized to invoke.
-Do not store endpoint credentials in structured-property values; use the
-downstream service's credential-management mechanism.
+```powershell
+python scripts\bootstrap_datahub_demo.py `
+  --apply `
+  --confirm-target "http://localhost:8080"
+```
+
+The bootstrap first checks all three exact asset URNs for collisions, before
+applying structured-property definitions or any asset mutation. It fails closed
+if one already exists. Only for a deliberate idempotent rerun of these exact
+demo assets, add `--allow-existing-demo-assets`. A non-loopback target is also
+refused unless its canonical origin is confirmed and
+`--allow-remote-target` is supplied explicitly.
+
+The live bootstrap seeds the uniquely namespaced Postgres Dataset
+`aftershock_demo.inventory_pricing` in `DEV`, an Airflow DataFlow/DataJob in
+`DEV`, the two remediation properties on that DataJob, and one
+Dataset-to-DataJob lineage edge. It deliberately does not manufacture
+Dataset-to-MLModel lineage. The offline fixture remains an explicitly synthetic
+`PROD` graph and includes a labeled MLModel example only to exercise mixed
+target rendering and receipt handling; its URNs are not the live seed URNs.
+
+The seeded loopback remediation URL is a placeholder. No receiver is created
+by the bootstrap, so a control receipt will not succeed unless an authorized
+receiver exists at that exact URL and it is explicitly allowlisted in
+`AFTERSHOCK_REMEDIATION_ALLOWLIST_JSON`. Do not store endpoint credentials in
+structured-property values; use the downstream service's credential-management
+mechanism.
 
 ## 4. Choose exactly one MCP transport
 
@@ -117,7 +128,7 @@ Send the current normalized envelope from a second PowerShell window:
 $headers = @{ Authorization = "Bearer replace-with-a-long-random-secret" }
 $body = @{
   incident_id = "INC-LIVE-001"
-  dataset_urn = "urn:li:dataset:(urn:li:dataPlatform:postgres,inventory_pricing,PROD)"
+  dataset_urn = "urn:li:dataset:(urn:li:dataPlatform:postgres,aftershock_demo.inventory_pricing,DEV)"
   severity = "CRITICAL"
 } | ConvertTo-Json
 

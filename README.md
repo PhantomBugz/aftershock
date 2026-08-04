@@ -86,6 +86,11 @@ example remediation hosts are intentionally non-production and will normally
 produce failed control receipts. Use the dashboard above for a deterministic
 all-success presentation.
 
+Fixture metadata is explicitly synthetic and uses `PROD` URNs. The separate
+live bootstrap uses collision-checked, uniquely namespaced `DEV` assets such as
+`aftershock_demo.inventory_pricing`; see the [live setup guide][live-setup] for
+the mandatory target confirmation and exact commands.
+
 ```powershell
 $env:AFTERSHOCK_DATAHUB_MODE = "fixture"
 $env:AFTERSHOCK_WEBHOOK_TOKEN = "replace-with-a-long-random-secret"
@@ -174,3 +179,4 @@ Licensed under the [Apache License 2.0](LICENSE).
 [mcl]: https://docs.datahub.com/docs/actions/events/metadata-change-log-event
 [actions]: https://docs.datahub.com/docs/actions/guides/developing-an-action
 [quickstart]: https://docs.datahub.com/docs/quickstart
+[live-setup]: docs/live-datahub-setup.md

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 import subprocess
@@ -10,8 +11,9 @@ import warnings
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
-from datahub.errors import ExperimentalWarning
+from datahub.errors import ExperimentalWarning, ItemNotFoundError
 from datahub.ingestion.graph.config import DatahubClientConfig
 
 with warnings.catch_warnings():
@@ -32,10 +34,13 @@ ROOT = Path(__file__).resolve().parents[1]
 PROPERTY_FILE = ROOT / "config" / "aftershock_structured_properties.yaml"
 PROPERTY_FILE_DISPLAY = "config/aftershock_structured_properties.yaml"
 
-DATASET_URN = "urn:li:dataset:(urn:li:dataPlatform:postgres,inventory_pricing,PROD)"
-FLOW_URN = "urn:li:dataFlow:(airflow,aftershock_demo,PROD)"
+DATASET_URN = (
+    "urn:li:dataset:(urn:li:dataPlatform:postgres,"
+    "aftershock_demo.inventory_pricing,DEV)"
+)
+FLOW_URN = "urn:li:dataFlow:(airflow,aftershock_demo,DEV)"
 JOB_URN = (
-    "urn:li:dataJob:(urn:li:dataFlow:(airflow,aftershock_demo,PROD),"
+    "urn:li:dataJob:(urn:li:dataFlow:(airflow,aftershock_demo,DEV),"
     "purchase_order_generator)"
 )
 BUSINESS_ACTION_PROPERTY_URN = (
@@ -59,15 +64,15 @@ def build_demo_assets() -> tuple[Dataset, DataFlow, DataJob]:
 
     dataset = Dataset(
         platform="postgres",
-        name="inventory_pricing",
-        env="PROD",
+        name="aftershock_demo.inventory_pricing",
+        env="DEV",
         display_name="Inventory Pricing",
         description="Synthetic upstream pricing data for the Aftershock demo.",
     )
     flow = DataFlow(
         platform="airflow",
         name="aftershock_demo",
-        env="PROD",
+        env="DEV",
         display_name="Aftershock Demo",
         description="Synthetic flow containing the Aftershock demo DataJob.",
     )
@@ -94,9 +99,57 @@ def _definition_command(*, absolute_path: bool) -> tuple[str, ...]:
     return ("datahub", "properties", "upsert", "-f", path)
 
 
-def _plan(mode: Mode) -> dict[str, object]:
+def _canonical_target(raw_url: str) -> tuple[str, str]:
+    """Return a secret-free canonical origin and normalized host."""
+
+    try:
+        parsed = urlsplit(raw_url)
+        scheme = parsed.scheme.lower()
+        if (
+            scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or "#" in raw_url
+        ):
+            raise ValueError
+        host = parsed.hostname.lower()
+        port = parsed.port
+    except (TypeError, ValueError):
+        raise ValueError("DATAHUB_GMS_URL is invalid or unsafe") from None
+
+    if any(character.isspace() for character in host):
+        raise ValueError("DATAHUB_GMS_URL is invalid or unsafe")
+    if port is None:
+        port = 80 if scheme == "http" else 443
+    rendered_host = f"[{host}]" if ":" in host else host
+    return f"{scheme}://{rendered_host}:{port}", host
+
+
+def _is_loopback_host(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _dry_run_target_origin(source: Mapping[str, str]) -> str:
+    configured = source.get("DATAHUB_GMS_URL", "").strip()
+    if not configured:
+        return "not configured"
+    try:
+        origin, _ = _canonical_target(configured)
+    except ValueError:
+        return "invalid or unsafe configuration"
+    return origin
+
+
+def _plan(mode: Mode, *, target_origin: str) -> dict[str, object]:
     return {
         "mode": mode,
+        "target_origin": target_origin,
         "definitions_command": list(_definition_command(absolute_path=False)),
         "assets": [DATASET_URN, FLOW_URN, JOB_URN],
         "lineage": {"upstream": DATASET_URN, "downstream": JOB_URN},
@@ -132,6 +185,9 @@ def execute_bootstrap(
     *,
     mode: Mode,
     environ: Mapping[str, str] | None = None,
+    confirm_target: str | None = None,
+    allow_remote_target: bool = False,
+    allow_existing_demo_assets: bool = False,
     client_factory: ClientFactory = DataHubClient,
     definitions_runner: DefinitionsRunner = _run_definitions,
 ) -> dict[str, object]:
@@ -144,21 +200,22 @@ def execute_bootstrap(
     if mode == "dry-run":
         # Constructing SDK entity objects is local and deterministic, but is
         # intentionally unnecessary here: dry-run performs no client work.
-        return _plan(mode)
+        return _plan(mode, target_origin=_dry_run_target_origin(source))
 
     gms_url = source.get("DATAHUB_GMS_URL", "").strip()
     if not gms_url:
         raise ValueError("DATAHUB_GMS_URL must be set for --apply")
 
     try:
-        definitions_runner(
-            _definition_command(absolute_path=True),
-            source,
+        target_origin, target_host = _canonical_target(gms_url)
+    except ValueError:
+        raise ValueError("DATAHUB_GMS_URL is invalid or unsafe") from None
+    if confirm_target != target_origin:
+        raise ValueError("target confirmation does not match DATAHUB_GMS_URL origin")
+    if not _is_loopback_host(target_host) and not allow_remote_target:
+        raise ValueError(
+            "remote DataHub target requires --allow-remote-target"
         )
-    except Exception:
-        raise BootstrapError(
-            "structured-property definition upsert failed"
-        ) from None
 
     try:
         client_config = DatahubClientConfig(
@@ -171,6 +228,30 @@ def execute_bootstrap(
         client = client_factory(config=client_config)
     except Exception:
         raise BootstrapError("DataHub client creation failed") from None
+
+    collision_found = False
+    for urn in (DATASET_URN, FLOW_URN, JOB_URN):
+        try:
+            client.entities.get(urn)
+        except ItemNotFoundError:
+            continue
+        except Exception:
+            raise BootstrapError(
+                "DataHub demo asset collision preflight failed"
+            ) from None
+        collision_found = True
+    if collision_found and not allow_existing_demo_assets:
+        raise BootstrapError("DataHub demo asset collision detected")
+
+    try:
+        definitions_runner(
+            _definition_command(absolute_path=True),
+            source,
+        )
+    except Exception:
+        raise BootstrapError(
+            "structured-property definition upsert failed"
+        ) from None
 
     try:
         dataset, flow, job = build_demo_assets()
@@ -194,7 +275,7 @@ def execute_bootstrap(
         )
     except Exception:
         raise BootstrapError("DataHub lineage creation failed") from None
-    return _plan(mode)
+    return _plan(mode, target_origin=target_origin)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -215,6 +296,23 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="apply definitions, assets, and Dataset-to-DataJob lineage",
     )
+    parser.add_argument(
+        "--confirm-target",
+        help=(
+            "for --apply, the exact canonical origin printed by --dry-run "
+            "(including port)"
+        ),
+    )
+    parser.add_argument(
+        "--allow-remote-target",
+        action="store_true",
+        help="allow --apply to a confirmed non-loopback DataHub origin",
+    )
+    parser.add_argument(
+        "--allow-existing-demo-assets",
+        action="store_true",
+        help="allow a deliberate idempotent rerun over the exact demo URNs",
+    )
     return parser
 
 
@@ -223,7 +321,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     mode: Mode = "apply" if args.apply else "dry-run"
     try:
-        result = execute_bootstrap(mode=mode)
+        result = execute_bootstrap(
+            mode=mode,
+            confirm_target=args.confirm_target,
+            allow_remote_target=args.allow_remote_target,
+            allow_existing_demo_assets=args.allow_existing_demo_assets,
+        )
     except (BootstrapError, ValueError) as exc:
         parser.error(str(exc))
     except Exception:
