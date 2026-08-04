@@ -27,7 +27,8 @@ def build_engine_override(
     return override
 
 
-def test_critical_incident_triggers_downstream_remediations() -> None:
+def test_critical_incident_triggers_downstream_remediations(monkeypatch) -> None:
+    monkeypatch.setenv("AFTERSHOCK_DATAHUB_MODE", "fixture")
     requests: list[httpx.Request] = []
     app.dependency_overrides[get_compensating_action_engine] = build_engine_override(
         requests
@@ -63,7 +64,8 @@ def test_critical_incident_triggers_downstream_remediations() -> None:
     }
 
 
-def test_noncritical_incident_returns_no_action_required() -> None:
+def test_noncritical_incident_returns_no_action_required(monkeypatch) -> None:
+    monkeypatch.setenv("AFTERSHOCK_DATAHUB_MODE", "fixture")
     requests: list[httpx.Request] = []
     app.dependency_overrides[get_compensating_action_engine] = build_engine_override(
         requests

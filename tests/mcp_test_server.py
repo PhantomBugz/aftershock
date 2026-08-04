@@ -13,7 +13,8 @@ DATASET_URN = (
     "urn:li:dataset:(urn:li:dataPlatform:postgres,inventory_pricing,PROD)"
 )
 DATA_JOB_URN = (
-    "urn:li:dataJob:(urn:li:dataFlow:airflow,purchase_order_generator,PROD)"
+    "urn:li:dataJob:(urn:li:dataFlow:(airflow,aftershock_demo,PROD),"
+    "purchase_order_generator)"
 )
 MODEL_URN = (
     "urn:li:mlModel:(urn:li:dataPlatform:sagemaker,dynamic_pricing_model,PROD)"

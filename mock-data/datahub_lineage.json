@@ -1,4 +1,8 @@
 {
+  "_fixture_metadata": {
+    "mode": "OFFLINE FIXTURE MODE",
+    "note": "The MLModel target is deterministic demo data, not proof of a live Dataset-to-MLModel lineage run."
+  },
   "data": {
     "dataset": {
       "urn": "urn:li:dataset:(urn:li:dataPlatform:postgres,inventory_pricing,PROD)",
@@ -6,11 +10,37 @@
         "entities": [
           {
             "entity": {
-              "urn": "urn:li:dataJob:(urn:li:dataFlow:airflow,purchase_order_generator,PROD)",
+              "urn": "urn:li:dataJob:(urn:li:dataFlow:(airflow,aftershock_demo,PROD),purchase_order_generator)",
               "type": "DATA_JOB",
-              "customProperties": {
-                "business_action": "ISSUE_PO",
-                "remediation_webhook": "https://api.internal.corp/remediate/cancel_po"
+              "structuredProperties": {
+                "properties": [
+                  {
+                    "structuredProperty": {
+                      "urn": "urn:li:structuredProperty:aftershock.businessAction",
+                      "definition": {
+                        "qualifiedName": "aftershock.businessAction"
+                      }
+                    },
+                    "values": [
+                      {
+                        "stringValue": "ISSUE_PO"
+                      }
+                    ]
+                  },
+                  {
+                    "structuredProperty": {
+                      "urn": "urn:li:structuredProperty:aftershock.remediationWebhook",
+                      "definition": {
+                        "qualifiedName": "aftershock.remediationWebhook"
+                      }
+                    },
+                    "values": [
+                      {
+                        "stringValue": "https://api.internal.example/remediate/cancel_po"
+                      }
+                    ]
+                  }
+                ]
               }
             }
           },
@@ -18,9 +48,35 @@
             "entity": {
               "urn": "urn:li:mlModel:(urn:li:dataPlatform:sagemaker,dynamic_pricing_model,PROD)",
               "type": "ML_MODEL",
-              "customProperties": {
-                "business_action": "ADJUST_PRICE",
-                "remediation_webhook": "https://api.internal.corp/remediate/revert_pricing"
+              "structuredProperties": {
+                "properties": [
+                  {
+                    "structuredProperty": {
+                      "urn": "urn:li:structuredProperty:aftershock.businessAction",
+                      "definition": {
+                        "qualifiedName": "aftershock.businessAction"
+                      }
+                    },
+                    "values": [
+                      {
+                        "stringValue": "ADJUST_PRICE"
+                      }
+                    ]
+                  },
+                  {
+                    "structuredProperty": {
+                      "urn": "urn:li:structuredProperty:aftershock.remediationWebhook",
+                      "definition": {
+                        "qualifiedName": "aftershock.remediationWebhook"
+                      }
+                    },
+                    "values": [
+                      {
+                        "stringValue": "https://api.internal.example/remediate/revert_pricing"
+                      }
+                    ]
+                  }
+                ]
               }
             }
           }

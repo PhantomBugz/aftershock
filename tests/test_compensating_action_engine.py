@@ -4,17 +4,18 @@ from pathlib import Path
 
 import httpx
 
+from blast_radius_mapper import BlastRadiusMapper
 from compensating_action_engine import CompensatingActionEngine
+from datahub_context import FixtureDataHubContext
 
 
 FIXTURE_PATH = (
     Path(__file__).resolve().parents[1] / "mock-data" / "datahub_lineage.json"
 )
+DATASET_URN = "urn:li:dataset:(urn:li:dataPlatform:postgres,inventory_pricing,PROD)"
 
 
 def test_processes_each_downstream_entity_with_real_async_posts() -> None:
-    graph = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
-    entities = graph["data"]["dataset"]["downstreamLineage"]["entities"]
     requests: list[httpx.Request] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -22,6 +23,8 @@ def test_processes_each_downstream_entity_with_real_async_posts() -> None:
         return httpx.Response(200, json={"status": "accepted"})
 
     async def scenario() -> list[bool]:
+        mapper = BlastRadiusMapper(FixtureDataHubContext(FIXTURE_PATH))
+        entities = await mapper.get_actionable_targets(DATASET_URN)
         async with httpx.AsyncClient(
             transport=httpx.MockTransport(handler), timeout=10.0
         ) as client:

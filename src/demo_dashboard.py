@@ -14,6 +14,7 @@ from rich.tree import Tree
 
 from blast_radius_mapper import BlastRadiusMapper
 from compensating_action_engine import CompensatingActionEngine
+from datahub_context import FixtureDataHubContext
 
 
 DEMO_DATASET_URN = (
@@ -65,7 +66,7 @@ async def run_demo(
     """Render four acts while executing the real compensating-action engine."""
 
     active_console = console or Console()
-    mapper = BlastRadiusMapper(gms_url="")
+    mapper = BlastRadiusMapper(FixtureDataHubContext())
     downstream_entities = await mapper.get_actionable_targets(DEMO_DATASET_URN)
 
     active_console.print(

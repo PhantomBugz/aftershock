@@ -1,145 +1,199 @@
-"""Resolve actionable downstream entities from a DataHub lineage graph."""
+"""Map downstream DataHub MCP lineage to typed remediation targets."""
 
 from __future__ import annotations
 
-import json
-import os
 from collections.abc import Mapping, Sequence
-from pathlib import Path
 from typing import Any
 
-import httpx
+from datahub_context import DataHubContextPort, build_datahub_context_from_env
+from remediation_models import ActionableTarget
 
 
-DEFAULT_GRAPH_PATH = (
-    Path(__file__).resolve().parents[1] / "mock-data" / "datahub_lineage.json"
-)
+BUSINESS_ACTION_PROPERTY = "aftershock.businessAction"
+REMEDIATION_WEBHOOK_PROPERTY = "aftershock.remediationWebhook"
+UNKNOWN_ENTITY_TYPE = "UNKNOWN"
 
-DOWNSTREAM_LINEAGE_QUERY = """
-query AftershockDownstreamLineage($urn: String!) {
-  dataset(urn: $urn) {
-    urn
-    downstreamLineage: lineage(input: { direction: DOWNSTREAM }) {
-      entities {
-        urn
-        type
-        ... on DataJob {
-          properties {
-            customProperties {
-              key
-              value
-            }
-          }
-        }
-        ... on MLModel {
-          properties {
-            customProperties {
-              key
-              value
-            }
-          }
-        }
-      }
-    }
-  }
-}
-"""
+
+class BlastRadiusMappingError(RuntimeError):
+    """The lineage response contained a node that could not be identified."""
 
 
 class BlastRadiusMapper:
-    """Resolve downstream entities from live DataHub or an offline fixture."""
+    """Resolve downstream lineage and its structured remediation properties."""
 
-    def __init__(
-        self,
-        graph_path: str | Path | None = None,
-        *,
-        http_client: httpx.AsyncClient | None = None,
-        gms_url: str | None = None,
-    ) -> None:
-        self.graph_path = Path(graph_path) if graph_path else DEFAULT_GRAPH_PATH
-        self.http_client = http_client
-        self.gms_url = (
-            os.getenv("DATAHUB_GMS_URL") if gms_url is None else gms_url
+    def __init__(self, context: DataHubContextPort | None = None) -> None:
+        self.context = (
+            context if context is not None else build_datahub_context_from_env()
         )
 
+    async def get_targets(self, dataset_urn: str) -> list[ActionableTarget]:
+        """Return every identifiable downstream node in lineage order.
+
+        Detail lookup is intentionally batched and joined by URN because the MCP
+        response order is not part of the mapper's contract. Nodes without a
+        complete playbook remain in the result so execution can report them as
+        skipped rather than hiding part of the blast radius.
+        """
+
+        lineage = await self.context.get_lineage(dataset_urn)
+        lineage_entities = _lineage_entities(lineage)
+        if not lineage_entities:
+            return []
+
+        unique_urns = list(dict.fromkeys(entity["urn"] for entity in lineage_entities))
+        details = await self.context.get_entities(unique_urns)
+        details_by_urn = _details_by_urn(details)
+
+        targets: list[ActionableTarget] = []
+        for lineage_entity in lineage_entities:
+            urn = lineage_entity["urn"]
+            detail = details_by_urn.get(urn)
+            detail_is_usable = detail is not None and not _has_entity_error(detail)
+            source = detail if detail_is_usable else None
+
+            targets.append(
+                ActionableTarget(
+                    urn=urn,
+                    entity_type=_entity_type(source, fallback=lineage_entity),
+                    business_action=_structured_string(
+                        source, BUSINESS_ACTION_PROPERTY
+                    ),
+                    remediation_webhook=_structured_string(
+                        source, REMEDIATION_WEBHOOK_PROPERTY
+                    ),
+                )
+            )
+        return targets
+
     async def get_actionable_targets(self, dataset_urn: str) -> list[dict[str, Any]]:
-        """Return normalized downstream entities for a dataset URN."""
+        """Deprecated compatibility view for the pre-receipt action engine.
 
-        if self.gms_url:
-            return await self._get_live_targets(dataset_urn)
+        New callers should consume :meth:`get_targets` and ``ActionableTarget``
+        directly. This adapter can be removed when the listener is migrated.
+        """
 
-        graph = json.loads(self.graph_path.read_text(encoding="utf-8"))
-        dataset = graph["data"]["dataset"]
-        if dataset["urn"] != dataset_urn:
-            return []
-        return dataset["downstreamLineage"]["entities"]
-
-    async def _get_live_targets(self, dataset_urn: str) -> list[dict[str, Any]]:
-        endpoint = f"{self.gms_url.rstrip('/')}/api/graphql"
-        payload = {
-            "query": DOWNSTREAM_LINEAGE_QUERY,
-            "variables": {"urn": dataset_urn},
-        }
-
-        if self.http_client is not None:
-            response = await self.http_client.post(endpoint, json=payload)
-        else:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                response = await client.post(endpoint, json=payload)
-
-        response.raise_for_status()
-        body = response.json()
-        if body.get("errors"):
-            raise RuntimeError(f"DataHub GraphQL query failed: {body['errors']}")
-
-        dataset = body.get("data", {}).get("dataset")
-        if not isinstance(dataset, Mapping):
-            return []
-
-        lineage = dataset.get("downstreamLineage")
-        if not isinstance(lineage, Mapping):
-            return []
-
-        entities = lineage.get("entities", [])
-        if not isinstance(entities, Sequence) or isinstance(entities, (str, bytes)):
-            return []
-
+        targets = await self.get_targets(dataset_urn)
         return [
-            {"entity": self._normalize_entity(entity)}
-            for entity in entities
-            if isinstance(entity, Mapping)
+            {
+                "entity": {
+                    "urn": target.urn,
+                    "type": target.entity_type,
+                    "customProperties": {
+                        "business_action": target.business_action,
+                        "remediation_webhook": target.remediation_webhook,
+                    },
+                }
+            }
+            for target in targets
         ]
 
-    @staticmethod
-    def _normalize_entity(entity: Mapping[str, Any]) -> dict[str, Any]:
-        properties = entity.get("properties")
-        if isinstance(properties, Mapping):
-            raw_custom_properties = properties.get("customProperties", [])
-        else:
-            raw_custom_properties = entity.get("customProperties", [])
 
-        return {
-            "urn": entity.get("urn", "UNKNOWN_URN"),
-            "type": entity.get("type", "UNKNOWN"),
-            "customProperties": BlastRadiusMapper._normalize_custom_properties(
-                raw_custom_properties
-            ),
-        }
+def _lineage_entities(payload: Mapping[str, Any]) -> list[dict[str, str]]:
+    downstreams = payload.get("downstreams")
+    if not isinstance(downstreams, Mapping):
+        raise BlastRadiusMappingError("DataHub lineage response has no downstreams")
 
-    @staticmethod
-    def _normalize_custom_properties(raw_properties: Any) -> dict[str, Any]:
-        if isinstance(raw_properties, Mapping):
-            return dict(raw_properties)
-        if not isinstance(raw_properties, Sequence) or isinstance(
-            raw_properties, (str, bytes)
-        ):
-            return {}
+    search_results = downstreams.get("searchResults", [])
+    if not isinstance(search_results, Sequence) or isinstance(
+        search_results, (str, bytes)
+    ):
+        raise BlastRadiusMappingError("DataHub lineage searchResults is malformed")
 
-        normalized: dict[str, Any] = {}
-        for item in raw_properties:
-            if not isinstance(item, Mapping):
+    entities: list[dict[str, str]] = []
+    for index, result in enumerate(search_results):
+        if not isinstance(result, Mapping):
+            raise BlastRadiusMappingError(
+                f"DataHub lineage result {index} is malformed"
+            )
+        entity = result.get("entity")
+        if not isinstance(entity, Mapping):
+            raise BlastRadiusMappingError(
+                f"DataHub lineage result {index} has no entity"
+            )
+        urn = entity.get("urn")
+        if not isinstance(urn, str) or not urn.strip():
+            raise BlastRadiusMappingError(
+                f"DataHub lineage result {index} has no valid URN"
+            )
+        entity_type = entity.get("type")
+        entities.append(
+            {
+                "urn": urn,
+                "type": (
+                    entity_type.strip()
+                    if isinstance(entity_type, str) and entity_type.strip()
+                    else UNKNOWN_ENTITY_TYPE
+                ),
+            }
+        )
+    return entities
+
+
+def _details_by_urn(
+    details: Sequence[Mapping[str, Any]],
+) -> dict[str, Mapping[str, Any]]:
+    by_urn: dict[str, Mapping[str, Any]] = {}
+    for detail in details:
+        if not isinstance(detail, Mapping):
+            continue
+        urn = detail.get("urn")
+        if isinstance(urn, str) and urn and urn not in by_urn:
+            by_urn[urn] = detail
+    return by_urn
+
+
+def _has_entity_error(detail: Mapping[str, Any]) -> bool:
+    return bool(detail.get("error") or detail.get("errors"))
+
+
+def _entity_type(
+    detail: Mapping[str, Any] | None,
+    *,
+    fallback: Mapping[str, Any],
+) -> str:
+    if detail is not None:
+        entity_type = detail.get("type")
+        if isinstance(entity_type, str) and entity_type.strip():
+            return entity_type.strip()
+    fallback_type = fallback.get("type")
+    if isinstance(fallback_type, str) and fallback_type.strip():
+        return fallback_type.strip()
+    return UNKNOWN_ENTITY_TYPE
+
+
+def _structured_string(
+    detail: Mapping[str, Any] | None,
+    qualified_name: str,
+) -> str | None:
+    if detail is None:
+        return None
+    structured = detail.get("structuredProperties")
+    if not isinstance(structured, Mapping):
+        return None
+    properties = structured.get("properties")
+    if not isinstance(properties, Sequence) or isinstance(
+        properties, (str, bytes)
+    ):
+        return None
+
+    for property_value in properties:
+        if not isinstance(property_value, Mapping):
+            continue
+        structured_property = property_value.get("structuredProperty")
+        if not isinstance(structured_property, Mapping):
+            continue
+        definition = structured_property.get("definition")
+        if not isinstance(definition, Mapping):
+            continue
+        if definition.get("qualifiedName") != qualified_name:
+            continue
+        values = property_value.get("values")
+        if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
+            continue
+        for value in values:
+            if not isinstance(value, Mapping):
                 continue
-            key = item.get("key")
-            if key is not None:
-                normalized[str(key)] = item.get("value")
-        return normalized
+            string_value = value.get("stringValue")
+            if isinstance(string_value, str) and string_value.strip():
+                return string_value.strip()
+    return None
