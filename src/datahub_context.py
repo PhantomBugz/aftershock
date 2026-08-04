@@ -19,6 +19,10 @@ DEFAULT_FIXTURE_PATH = (
     Path(__file__).resolve().parents[1] / "mock-data" / "datahub_lineage.json"
 )
 _PAGE_SIZE = 100
+_MAX_LINEAGE_PAGES = 100
+_MAX_LINEAGE_RESULTS = 10_000
+_CLIENT_TIMEOUT_SECONDS = 30.0
+_CLIENT_INIT_TIMEOUT_SECONDS = 10.0
 _PRESERVED_SUBPROCESS_ENV = (
     "PATH",
     "PATHEXT",
@@ -105,7 +109,13 @@ def parse_tool_result(result: Any, *, tool_name: str) -> dict[str, Any] | list[A
     else:
         structured_content = getattr(result, "structured_content", None)
         if structured_content is not None:
-            payload = structured_content
+            if (
+                isinstance(structured_content, dict)
+                and set(structured_content) == {"result"}
+            ):
+                payload = structured_content["result"]
+            else:
+                payload = structured_content
         else:
             content = getattr(result, "content", None)
             if not isinstance(content, Sequence) or isinstance(
@@ -160,8 +170,10 @@ class MCPDataHubContext:
         offset = 0
         combined: dict[str, Any] | None = None
         combined_results: list[Any] = []
+        seen_pages: list[list[Any]] = []
+        expected_total: int | None = None
 
-        while True:
+        for page_number in range(_MAX_LINEAGE_PAGES):
             payload = await self._call_tool(
                 "get_lineage",
                 {
@@ -175,33 +187,70 @@ class MCPDataHubContext:
             if not isinstance(payload, dict):
                 raise _tool_error("get_lineage", "returned an unsupported payload")
 
-            downstreams = payload.get("downstreams")
-            page_result_count = 0
+            downstreams, page_results, total, has_more = _parse_lineage_page(
+                payload,
+                expected_offset=offset,
+            )
+            if expected_total is None:
+                expected_total = total
+            elif total != expected_total:
+                raise _tool_error(
+                    "get_lineage", "returned inconsistent lineage metadata"
+                )
+            if page_results and any(
+                page_results == prior_page for prior_page in seen_pages
+            ):
+                raise _tool_error(
+                    "get_lineage", "returned a repeated lineage page"
+                )
+            if page_results:
+                seen_pages.append(deepcopy(page_results))
+
+            if total > _MAX_LINEAGE_RESULTS or (
+                len(combined_results) + len(page_results)
+                > _MAX_LINEAGE_RESULTS
+            ):
+                raise _tool_error(
+                    "get_lineage", "exceeded the result safety limit"
+                )
+
             if combined is None:
                 combined = deepcopy(payload)
-            if isinstance(downstreams, Mapping):
-                search_results = downstreams.get("searchResults", [])
-                if isinstance(search_results, Sequence) and not isinstance(
-                    search_results, (str, bytes)
-                ):
-                    page_result_count = len(search_results)
-                    combined_results.extend(search_results)
+            combined_results.extend(page_results)
 
-                combined_downstreams = combined.setdefault("downstreams", {})
-                if not isinstance(combined_downstreams, dict):
+            combined_downstreams = combined.setdefault("downstreams", {})
+            if not isinstance(combined_downstreams, dict):
+                raise _tool_error(
+                    "get_lineage", "returned an unsupported payload"
+                )
+            combined_downstreams.update(deepcopy(dict(downstreams)))
+            combined_downstreams["searchResults"] = combined_results
+
+            if not has_more:
+                if total != len(combined_results):
                     raise _tool_error(
-                        "get_lineage", "returned an unsupported payload"
+                        "get_lineage", "returned an incomplete lineage response"
                     )
-                combined_downstreams.update(deepcopy(dict(downstreams)))
-                combined_downstreams["searchResults"] = combined_results
-
-            if not _lineage_has_more(payload, offset=offset):
+                combined_downstreams.update(
+                    {
+                        "total": total,
+                        "offset": 0,
+                        "returned": len(combined_results),
+                        "hasMore": False,
+                    }
+                )
                 return combined
-            if page_result_count == 0:
+            if not page_results:
                 raise _tool_error(
                     "get_lineage", "returned invalid pagination metadata"
                 )
-            offset += page_result_count
+            if page_number + 1 >= _MAX_LINEAGE_PAGES:
+                raise _tool_error(
+                    "get_lineage", "exceeded the pagination safety limit"
+                )
+            offset += len(page_results)
+
+        raise _tool_error("get_lineage", "exceeded the pagination safety limit")
 
     async def get_entities(
         self, urns: Sequence[str]
@@ -245,29 +294,75 @@ class MCPDataHubContext:
         return payload
 
 
-def _lineage_has_more(payload: Mapping[str, Any], *, offset: int) -> bool:
+def _parse_lineage_page(
+    payload: Mapping[str, Any],
+    *,
+    expected_offset: int,
+) -> tuple[Mapping[str, Any], list[Any], int, bool]:
+    """Validate one official DataHub lineage page and return typed metadata."""
+
     downstreams = payload.get("downstreams")
     if not isinstance(downstreams, Mapping):
-        return False
+        raise _tool_error("get_lineage", "returned invalid lineage metadata")
 
-    for key in ("hasMore", "has_more"):
-        value = downstreams.get(key)
-        if isinstance(value, bool):
-            return value
+    if "searchResults" not in downstreams:
+        total = downstreams.get("total")
+        offset = downstreams.get("offset", expected_offset)
+        returned = downstreams.get("returned", 0)
+        has_more = downstreams.get("hasMore", False)
+        if (
+            (
+                "total" in downstreams
+                and (not _is_nonnegative_int(total) or total != 0)
+            )
+            or (
+                "offset" in downstreams
+                and (
+                    not _is_nonnegative_int(offset)
+                    or offset != expected_offset
+                )
+            )
+            or (
+                "returned" in downstreams
+                and (not _is_nonnegative_int(returned) or returned != 0)
+            )
+            or not isinstance(has_more, bool)
+            or has_more
+        ):
+            raise _tool_error("get_lineage", "returned invalid lineage metadata")
+        return downstreams, [], 0, False
 
-    page_info = downstreams.get("pageInfo")
-    if isinstance(page_info, Mapping):
-        value = page_info.get("hasNextPage")
-        if isinstance(value, bool):
-            return value
-
-    total = downstreams.get("total")
-    search_results = downstreams.get("searchResults")
-    if isinstance(total, int) and isinstance(search_results, Sequence) and not isinstance(
+    search_results = downstreams["searchResults"]
+    if not isinstance(search_results, Sequence) or isinstance(
         search_results, (str, bytes)
     ):
-        return offset + len(search_results) < total
-    return False
+        raise _tool_error("get_lineage", "returned invalid lineage metadata")
+
+    total = downstreams.get("total")
+    offset = downstreams.get("offset")
+    returned = downstreams.get("returned")
+    has_more = downstreams.get("hasMore")
+    if (
+        not _is_nonnegative_int(total)
+        or not _is_nonnegative_int(offset)
+        or not _is_nonnegative_int(returned)
+        or not isinstance(has_more, bool)
+        or offset != expected_offset
+        or returned != len(search_results)
+        or total < offset + returned
+    ):
+        raise _tool_error("get_lineage", "returned invalid lineage metadata")
+
+    if has_more and total <= offset + returned:
+        raise _tool_error("get_lineage", "returned invalid lineage metadata")
+    if not has_more and total > offset + returned:
+        raise _tool_error("get_lineage", "returned an incomplete lineage response")
+
+    return downstreams, list(search_results), total, has_more
+
+
+def _is_nonnegative_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
 class FixtureDataHubContext:
@@ -397,18 +492,29 @@ def build_mcp_client_factory(
                 headers=dict(headers),
                 httpx_client_factory=_new_httpx_client,
             )
-            return Client(transport)
+            return Client(
+                transport,
+                timeout=_CLIENT_TIMEOUT_SECONDS,
+                init_timeout=_CLIENT_INIT_TIMEOUT_SECONDS,
+            )
 
         return remote_factory
+
+    gms_url = source.get("DATAHUB_GMS_URL")
+    if not gms_url or not gms_url.strip():
+        raise DataHubConfigurationError(
+            "DATAHUB_GMS_URL must be explicitly set for local stdio MCP mode"
+        )
 
     child_env = {
         key: source[key]
         for key in _PRESERVED_SUBPROCESS_ENV
         if source.get(key) is not None
     }
-    for key in ("DATAHUB_GMS_URL", "DATAHUB_GMS_TOKEN"):
-        if source.get(key):
-            child_env[key] = source[key]
+    child_env["DATAHUB_GMS_URL"] = gms_url
+    if source.get("DATAHUB_GMS_TOKEN"):
+        child_env["DATAHUB_GMS_TOKEN"] = source["DATAHUB_GMS_TOKEN"]
+    child_env["DATAHUB_SKIP_CONFIG"] = "true"
     child_env["TOOLS_IS_MUTATION_ENABLED"] = "true"
 
     def stdio_factory() -> Client:
@@ -418,7 +524,11 @@ def build_mcp_client_factory(
             env=dict(child_env),
             keep_alive=False,
         )
-        return Client(transport)
+        return Client(
+            transport,
+            timeout=_CLIENT_TIMEOUT_SECONDS,
+            init_timeout=_CLIENT_INIT_TIMEOUT_SECONDS,
+        )
 
     return stdio_factory
 

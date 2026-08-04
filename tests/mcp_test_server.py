@@ -30,6 +30,9 @@ class MCPCallRecorder:
             0: {
                 "downstreams": {
                     "searchResults": [{"entity": {"urn": DATA_JOB_URN}}],
+                    "total": 1,
+                    "offset": 0,
+                    "returned": 1,
                     "hasMore": False,
                 }
             }

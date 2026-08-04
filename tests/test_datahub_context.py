@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -42,12 +43,18 @@ def test_get_lineage_uses_real_mcp_and_paginates_downstreams() -> None:
             0: {
                 "downstreams": {
                     "searchResults": [{"entity": {"urn": DATA_JOB_URN}}],
+                    "total": 2,
+                    "offset": 0,
+                    "returned": 1,
                     "hasMore": True,
                 }
             },
             1: {
                 "downstreams": {
                     "searchResults": [{"entity": {"urn": MODEL_URN}}],
+                    "total": 2,
+                    "offset": 1,
+                    "returned": 1,
                     "hasMore": False,
                 }
             },
@@ -83,7 +90,16 @@ def test_get_lineage_uses_real_mcp_and_paginates_downstreams() -> None:
         result["entity"]["urn"]
         for result in lineage["downstreams"]["searchResults"]
     ] == [DATA_JOB_URN, MODEL_URN]
-    assert lineage["downstreams"]["hasMore"] is False
+    assert lineage["downstreams"] == {
+        "searchResults": [
+            {"entity": {"urn": DATA_JOB_URN}},
+            {"entity": {"urn": MODEL_URN}},
+        ],
+        "total": 2,
+        "offset": 0,
+        "returned": 2,
+        "hasMore": False,
+    }
 
 
 def test_get_lineage_fails_closed_when_has_more_page_is_empty() -> None:
@@ -92,6 +108,9 @@ def test_get_lineage_fails_closed_when_has_more_page_is_empty() -> None:
             0: {
                 "downstreams": {
                     "searchResults": [],
+                    "total": 1,
+                    "offset": 0,
+                    "returned": 0,
                     "hasMore": True,
                 }
             }
@@ -117,6 +136,186 @@ def test_get_lineage_fails_closed_when_has_more_page_is_empty() -> None:
             },
         )
     ]
+
+
+def test_get_lineage_normalizes_legitimate_cleaned_zero_result_shape() -> None:
+    recorder = MCPCallRecorder(
+        lineage_pages={0: {"downstreams": {"total": 0}}}
+    )
+    context = MCPDataHubContext(client_factory=make_client_factory(recorder))
+
+    lineage = asyncio.run(context.get_lineage(DATASET_URN))
+
+    assert lineage == {
+        "downstreams": {
+            "searchResults": [],
+            "total": 0,
+            "offset": 0,
+            "returned": 0,
+            "hasMore": False,
+        }
+    }
+
+
+@pytest.mark.parametrize(
+    "downstreams",
+    [
+        None,
+        [],
+        {
+            "searchResults": {},
+            "total": 1,
+            "offset": 0,
+            "returned": 1,
+            "hasMore": False,
+        },
+        {
+            "total": 1,
+            "offset": 0,
+            "returned": 1,
+            "hasMore": False,
+        },
+        {
+            "searchResults": [{"entity": {"urn": DATA_JOB_URN}}],
+            "total": 1,
+            "offset": 0,
+            "returned": 2,
+            "hasMore": False,
+        },
+        {
+            "searchResults": [{"entity": {"urn": DATA_JOB_URN}}],
+            "total": 1,
+            "offset": 1,
+            "returned": 1,
+            "hasMore": False,
+        },
+        {
+            "searchResults": [{"entity": {"urn": DATA_JOB_URN}}],
+            "total": 1,
+            "offset": 0,
+            "returned": 1,
+            "hasMore": "false",
+        },
+        {"total": False},
+        {"total": 0, "offset": False},
+        {"total": 0, "returned": False},
+    ],
+)
+def test_get_lineage_rejects_inconsistent_official_metadata(
+    downstreams: Any,
+) -> None:
+    recorder = MCPCallRecorder(
+        lineage_pages={0: {"downstreams": downstreams}}
+    )
+    context = MCPDataHubContext(client_factory=make_client_factory(recorder))
+
+    with pytest.raises(DataHubMCPError):
+        asyncio.run(context.get_lineage(DATASET_URN))
+
+
+def test_get_lineage_rejects_incomplete_datahub_060_capped_response() -> None:
+    recorder = MCPCallRecorder(
+        lineage_pages={
+            0: {
+                "downstreams": {
+                    "searchResults": [{"entity": {"urn": DATA_JOB_URN}}],
+                    "total": 2,
+                    "offset": 0,
+                    "returned": 1,
+                    "hasMore": False,
+                }
+            }
+        }
+    )
+    context = MCPDataHubContext(client_factory=make_client_factory(recorder))
+
+    with pytest.raises(DataHubMCPError, match="incomplete lineage response"):
+        asyncio.run(context.get_lineage(DATASET_URN))
+
+
+def test_get_lineage_enforces_a_finite_page_limit(monkeypatch) -> None:
+    monkeypatch.setattr(datahub_context, "_MAX_LINEAGE_PAGES", 1, raising=False)
+    recorder = MCPCallRecorder(
+        lineage_pages={
+            0: {
+                "downstreams": {
+                    "searchResults": [{"entity": {"urn": DATA_JOB_URN}}],
+                    "total": 2,
+                    "offset": 0,
+                    "returned": 1,
+                    "hasMore": True,
+                }
+            },
+            1: {
+                "downstreams": {
+                    "searchResults": [{"entity": {"urn": MODEL_URN}}],
+                    "total": 2,
+                    "offset": 1,
+                    "returned": 1,
+                    "hasMore": False,
+                }
+            },
+        },
+        max_lineage_calls=1,
+    )
+    context = MCPDataHubContext(client_factory=make_client_factory(recorder))
+
+    with pytest.raises(DataHubMCPError, match="pagination safety limit"):
+        asyncio.run(context.get_lineage(DATASET_URN))
+
+
+def test_get_lineage_enforces_a_finite_result_limit(monkeypatch) -> None:
+    monkeypatch.setattr(datahub_context, "_MAX_LINEAGE_RESULTS", 1, raising=False)
+    recorder = MCPCallRecorder(
+        lineage_pages={
+            0: {
+                "downstreams": {
+                    "searchResults": [
+                        {"entity": {"urn": DATA_JOB_URN}},
+                        {"entity": {"urn": MODEL_URN}},
+                    ],
+                    "total": 2,
+                    "offset": 0,
+                    "returned": 2,
+                    "hasMore": False,
+                }
+            }
+        }
+    )
+    context = MCPDataHubContext(client_factory=make_client_factory(recorder))
+
+    with pytest.raises(DataHubMCPError, match="result safety limit"):
+        asyncio.run(context.get_lineage(DATASET_URN))
+
+
+def test_get_lineage_rejects_a_repeated_page() -> None:
+    repeated_result = {"entity": {"urn": DATA_JOB_URN}}
+    recorder = MCPCallRecorder(
+        lineage_pages={
+            0: {
+                "downstreams": {
+                    "searchResults": [repeated_result],
+                    "total": 2,
+                    "offset": 0,
+                    "returned": 1,
+                    "hasMore": True,
+                }
+            },
+            1: {
+                "downstreams": {
+                    "searchResults": [repeated_result],
+                    "total": 2,
+                    "offset": 1,
+                    "returned": 1,
+                    "hasMore": False,
+                }
+            },
+        }
+    )
+    context = MCPDataHubContext(client_factory=make_client_factory(recorder))
+
+    with pytest.raises(DataHubMCPError, match="repeated lineage page"):
+        asyncio.run(context.get_lineage(DATASET_URN))
 
 
 def test_get_entities_sends_one_batch_over_real_mcp() -> None:
@@ -183,6 +382,25 @@ def test_mcp_tool_error_is_wrapped_without_leaking_server_details() -> None:
     assert "super-secret-value" not in str(error.value)
 
 
+def test_client_initialization_timeout_is_sanitized() -> None:
+    class InitializationTimeoutClient:
+        async def __aenter__(self):
+            raise TimeoutError("timeout containing super-secret-value")
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+    context = MCPDataHubContext(
+        client_factory=lambda: InitializationTimeoutClient()  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(DataHubMCPError) as error:
+        asyncio.run(context.get_entities([DATA_JOB_URN]))
+
+    assert "get_entities" in str(error.value)
+    assert "super-secret-value" not in str(error.value)
+
+
 def test_save_document_rejects_an_ordinary_unsuccessful_payload() -> None:
     recorder = MCPCallRecorder(
         save_payload={
@@ -243,6 +461,26 @@ def test_tool_result_parser_prefers_data_then_structured_content_then_text() -> 
     assert parse_tool_result(
         [{"urn": DATA_JOB_URN}], tool_name="get_entities"
     ) == [{"urn": DATA_JOB_URN}]
+
+    list_payload = [{"urn": DATA_JOB_URN}, {"urn": MODEL_URN}]
+    assert parse_tool_result(
+        SimpleNamespace(
+            is_error=False,
+            data=None,
+            structured_content={"result": list_payload},
+            content=[],
+        ),
+        tool_name="get_entities",
+    ) == list_payload
+    assert parse_tool_result(
+        SimpleNamespace(
+            is_error=False,
+            data=None,
+            structured_content={"result": list_payload, "metadata": {}},
+            content=[],
+        ),
+        tool_name="get_entities",
+    ) == {"result": list_payload, "metadata": {}}
 
 
 def test_tool_result_parser_rejects_mcp_errors_and_ambiguous_text() -> None:
@@ -327,6 +565,7 @@ def test_mode_factory_requires_an_explicit_valid_mode(monkeypatch) -> None:
     assert fixture_context.mode == "fixture"
 
     monkeypatch.setenv("AFTERSHOCK_DATAHUB_MODE", "mcp")
+    monkeypatch.setenv("DATAHUB_MCP_URL", "https://mcp.example.test/context")
     mcp_context = build_datahub_context_from_env()
     assert isinstance(mcp_context, MCPDataHubContext)
     assert mcp_context.mode == "mcp"
@@ -368,8 +607,16 @@ def test_remote_transport_uses_only_the_separate_mcp_bearer_token(
             captured["httpx_client_factory"] = httpx_client_factory
 
     class FakeClient:
-        def __init__(self, transport: object) -> None:
+        def __init__(
+            self,
+            transport: object,
+            *,
+            timeout: float,
+            init_timeout: float,
+        ) -> None:
             captured["transport"] = transport
+            captured["timeout"] = timeout
+            captured["init_timeout"] = init_timeout
 
     monkeypatch.setattr(datahub_context, "StreamableHttpTransport", FakeTransport)
     monkeypatch.setattr(datahub_context, "Client", FakeClient)
@@ -388,7 +635,26 @@ def test_remote_transport_uses_only_the_separate_mcp_bearer_token(
         "Authorization": "Bearer mcp-only-token"
     }
     assert callable(captured["httpx_client_factory"])
+    assert math.isfinite(captured["timeout"]) and captured["timeout"] > 0
+    assert (
+        math.isfinite(captured["init_timeout"])
+        and captured["init_timeout"] > 0
+    )
     assert "must-not-be-forwarded" not in repr(captured)
+
+
+@pytest.mark.parametrize(
+    "environ",
+    [
+        {"PATH": "test-path"},
+        {"DATAHUB_GMS_URL": "   "},
+    ],
+)
+def test_stdio_transport_requires_an_explicit_gms_url(
+    environ: dict[str, str],
+) -> None:
+    with pytest.raises(DataHubConfigurationError, match="DATAHUB_GMS_URL"):
+        build_mcp_client_factory(environ)
 
 
 def test_stdio_transport_receives_only_local_datahub_credentials(
@@ -413,8 +679,16 @@ def test_stdio_transport_receives_only_local_datahub_credentials(
             )
 
     class FakeClient:
-        def __init__(self, transport: object) -> None:
+        def __init__(
+            self,
+            transport: object,
+            *,
+            timeout: float,
+            init_timeout: float,
+        ) -> None:
             captured["transport"] = transport
+            captured["timeout"] = timeout
+            captured["init_timeout"] = init_timeout
 
     monkeypatch.setattr(datahub_context, "StdioTransport", FakeTransport)
     monkeypatch.setattr(datahub_context, "Client", FakeClient)
@@ -426,6 +700,7 @@ def test_stdio_transport_receives_only_local_datahub_credentials(
             "DATAHUB_GMS_URL": "https://gms.example.test",
             "DATAHUB_GMS_TOKEN": "local-gms-token",
             "DATAHUB_MCP_TOKEN": "remote-only-token",
+            "DATAHUB_SKIP_CONFIG": "false",
             "UNRELATED_SECRET": "do-not-copy",
         }
     )
@@ -444,5 +719,23 @@ def test_stdio_transport_receives_only_local_datahub_credentials(
         "SYSTEMROOT": "C:\\Windows",
         "DATAHUB_GMS_URL": "https://gms.example.test",
         "DATAHUB_GMS_TOKEN": "local-gms-token",
+        "DATAHUB_SKIP_CONFIG": "true",
+        "TOOLS_IS_MUTATION_ENABLED": "true",
+    }
+    assert math.isfinite(captured["timeout"]) and captured["timeout"] > 0
+    assert (
+        math.isfinite(captured["init_timeout"])
+        and captured["init_timeout"] > 0
+    )
+
+    captured.clear()
+    tokenless_factory = build_mcp_client_factory(
+        {"DATAHUB_GMS_URL": "http://localhost:8080"}
+    )
+    tokenless_factory()
+
+    assert captured["env"] == {
+        "DATAHUB_GMS_URL": "http://localhost:8080",
+        "DATAHUB_SKIP_CONFIG": "true",
         "TOOLS_IS_MUTATION_ENABLED": "true",
     }
