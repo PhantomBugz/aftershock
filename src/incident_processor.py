@@ -76,7 +76,9 @@ class AftershockIncidentProcessor:
                 urn=document_urn,
                 related_assets=related_assets,
             )
-            saved_urn = _saved_document_urn(result)
+            saved_urn = _saved_document_urn(
+                result, expected_urn=document_urn
+            )
         except Exception:
             # MCP/server details can contain credentials or response content.
             # Keep the external receipt fixed and log no exception text.
@@ -128,12 +130,14 @@ def _incident_document_urn(incident_id: str, dataset_urn: str) -> str:
     return f"urn:li:document:aftershock-incident-{slug}-{digest}"
 
 
-def _saved_document_urn(result: object) -> str:
+def _saved_document_urn(result: object, *, expected_urn: str) -> str:
     if not isinstance(result, Mapping) or result.get("success") is not True:
         raise ValueError("invalid DataHub save result")
     urn = result.get("urn")
     if not isinstance(urn, str) or not _DOCUMENT_URN_PATTERN.fullmatch(urn):
         raise ValueError("invalid DataHub document URN")
+    if urn != expected_urn:
+        raise ValueError("DataHub returned a different document URN")
     return urn
 
 

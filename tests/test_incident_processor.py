@@ -102,6 +102,7 @@ def _recorder_with_mixed_targets() -> MCPCallRecorder:
             "message": "saved",
             "author": "urn:li:corpuser:test",
         },
+        echo_saved_urn=True,
     )
 
 
@@ -205,7 +206,7 @@ def test_processes_mixed_controls_then_writes_one_complete_mcp_summary() -> None
         receipts=report.receipts,
         writeback=WriteBackReceipt(
             status="succeeded",
-            document_urn=DOCUMENT_RESULT_URN,
+            document_urn=save_arguments["urn"],
             error=None,
         ),
     )
@@ -225,7 +226,7 @@ def test_processes_mixed_controls_then_writes_one_complete_mcp_summary() -> None
         "receipts": [receipt.to_dict() for receipt in report.receipts],
         "writeback": {
             "status": "succeeded",
-            "document_urn": DOCUMENT_RESULT_URN,
+            "document_urn": save_arguments["urn"],
             "error": None,
         },
     }
@@ -247,6 +248,7 @@ def test_zero_target_incidents_are_written_and_retry_urns_are_safe_and_stable() 
             }
         },
         save_payload={"success": True, "urn": DOCUMENT_RESULT_URN},
+        echo_saved_urn=True,
     )
 
     async def handler(_: httpx.Request) -> httpx.Response:
@@ -311,6 +313,7 @@ def test_writeback_failures_are_secret_safe_and_preserve_control_receipts(
     )
     recorder.entities_payload = [recorder.entities_payload[0]]  # type: ignore[index]
     recorder.save_payload = save_payload
+    recorder.echo_saved_urn = False
     recorder.fail_tool = fail_tool
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -331,6 +334,33 @@ def test_writeback_failures_are_secret_safe_and_preserve_control_receipts(
     assert "writeback-secret" not in serialized
     assert "super-secret-value" not in serialized
     assert recorder.events[-1] == "save_document"
+
+
+def test_valid_but_different_returned_document_urn_is_not_success() -> None:
+    recorder = _recorder_with_mixed_targets()
+    recorder.lineage_pages[0]["downstreams"]["searchResults"] = []
+    recorder.lineage_pages[0]["downstreams"].update(total=0, returned=0)
+    recorder.save_payload = {
+        "success": True,
+        "urn": "urn:li:document:server-selected-different-record",
+        "message": "contains writeback-secret",
+    }
+    recorder.echo_saved_urn = False
+
+    async def handler(_: httpx.Request) -> httpx.Response:
+        raise AssertionError("zero-target incidents must not call HTTP controls")
+
+    report = _run_processor(recorder, handler)
+
+    requested_urn = recorder.calls[-1][1]["urn"]
+    assert requested_urn != recorder.save_payload["urn"]
+    assert report.writeback == WriteBackReceipt(
+        status="failed",
+        document_urn=None,
+        error=WRITEBACK_ERROR,
+    )
+    assert "server-selected-different-record" not in json.dumps(report.to_dict())
+    assert "writeback-secret" not in json.dumps(report.to_dict())
 
 
 @pytest.mark.parametrize("fail_tool", ["get_lineage", "get_entities"])

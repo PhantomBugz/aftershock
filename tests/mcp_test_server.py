@@ -54,6 +54,7 @@ class MCPCallRecorder:
             "author": "urn:li:corpuser:test",
         }
     )
+    echo_saved_urn: bool = False
     fail_tool: str | None = None
     failure_message: str = "server failure containing super-secret-value"
     max_lineage_calls: int | None = None
@@ -123,6 +124,8 @@ def build_test_server(recorder: MCPCallRecorder) -> FastMCP:
         recorder.events.append("save_document")
         if recorder.fail_tool == "save_document":
             raise RuntimeError(recorder.failure_message)
+        if recorder.echo_saved_urn:
+            return {**recorder.save_payload, "urn": urn}
         return recorder.save_payload
 
     return server
