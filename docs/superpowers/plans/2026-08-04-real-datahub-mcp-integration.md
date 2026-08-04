@@ -6,7 +6,7 @@
 
 **Architecture:** A `DataHubContextPort` separates live MCP transport from fixtures. `BlastRadiusMapper` normalizes lineage plus structured properties, `CompensatingActionEngine` returns immutable receipts, and `AftershockIncidentProcessor` coordinates discovery, remediation, and one incident-document write-back. The FastAPI listener and Rich dashboard consume the same processor.
 
-**Tech Stack:** Python 3.12, official `mcp` Python SDK, official `mcp-server-datahub`, DataHub 1.6, FastAPI, httpx, Rich, pytest
+**Tech Stack:** Python 3.12, official `mcp` Python SDK 1.x, official `mcp-server-datahub` 0.6.0, DataHub 1.6, FastAPI, httpx, Rich, pytest
 
 ---
 
@@ -60,8 +60,8 @@ Expected: collection fails because `datahub_context` does not exist.
 Add both dependency ranges to `pyproject.toml` and `requirements.txt`:
 
 ```text
-mcp>=1.27,<2
-mcp-server-datahub>=0.5,<1
+mcp>=1.27.1,<2
+mcp-server-datahub==0.6.0
 ```
 
 Install with `python -m pip install -r requirements.txt`.
