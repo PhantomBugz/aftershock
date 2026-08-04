@@ -23,7 +23,7 @@ This step performs lineage discovery, control processing, and the incident-recor
 └────────────────────────────── Retrospective view from the completed workflow receipts ───────────────────────────────┘
 ACT 3  //  RECORDED CONTROL RECEIPTS
 Control processing occurred during the full workflow above; this is a retrospective receipt view.
-                                             Compensating-control receipts                                              
+                                             Compensating-control receipts
 ┌──────────┬───────────────────────────────────────┬───────────┬──────┬────────────────────────────────────────┬───────┐
 │ Type     │ Target / action                       │ Status    │ HTTP │ Endpoint                               │ Error │
 ├──────────┼───────────────────────────────────────┼───────────┼──────┼────────────────────────────────────────┼───────┤
