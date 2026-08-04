@@ -1,19 +1,72 @@
-# Aftershock: Operationalizing Data Lineage to Eradicate "Action Debt"
+# Aftershock: From Data Lineage to Operational Recovery
 
-## The Problem
+**Challenge category:** Agents That Do Real Work
 
-When data pipelines break silently, current observability tools send an alert to a dashboard. But what about downstream AI agents, marketing engines, and automated purchasing bots actively consuming that corrupted data? Fixing the pipeline does not stop a misinformed system from executing real-world actions. We call this unattended operational fallout **Action Debt**.
+## Inspiration
 
-## The Solution
+Data-quality tools can tell a team that a pricing dataset is unreliable, and
+lineage can show which systems are downstream. But an automated job or model
+may already be acting on that data. Repairing the dataset does not settle the
+operational follow-up. We call that follow-up **Action Debt**.
 
-Aftershock transforms DataHub from a passive metadata catalog into an active incident-response platform. By receiving critical DataHub incident webhooks, Aftershock identifies operational systems exposed through DataHub lineage and automatically invokes their predefined compensating controls. It maps the blast radius of a data incident to downstream business applications and fires state-reversing API playbooks to isolate or halt affected systems before the operational damage scales.
+## What it does
 
-## What Is Next: The Action-Provenance Ledger
+Aftershock is an incident-response agent built on DataHub. Given a critical,
+normalized incident envelope, it reads the downstream context graph through
+the official DataHub MCP server, resolves governed remediation metadata,
+invokes each configured compensating control, returns factual per-target
+receipts, and writes an incident summary back with `save_document`. The next
+operator or agent can inherit both the affected assets and the observed
+outcomes.
 
-Our MVP proves system-level remediation: identifying exposed downstream systems and triggering their macro-remediation webhooks. The strongest next architectural upgrade is an **Action-Provenance Ledger** linking incident time windows to exact transaction IDs. This would allow Aftershock to pass affected order numbers into remediation payloads for surgical, row-level transaction reversal without taking an entire downstream agent offline.
+## How DataHub is foundational
 
-## Judge Q&A
+- `get_lineage(upstream=false)` discovers downstream exposure.
+- `get_entities` resolves the exposed assets and their structured properties.
+- `aftershock.businessAction` and `aftershock.remediationWebhook` provide the
+  governed control mapping.
+- `save_document` persists the incident-specific receipt summary and related
+  asset URNs back into DataHub.
 
-**Is this just data observability or impact analysis?**
+This is implemented with `mcp-server-datahub==0.6.0` over FastMCP. A failed MCP
+call fails closed; live mode never silently switches to fixtures.
 
-No. Observability tells you data is broken, and impact analysis shows which analytical assets may be affected. Aftershock is the operational recovery layer: it uses DataHub lineage to identify exposed business systems and invokes their registered compensating controls.
+## Why it is different
+
+Aftershock composes catalog context with an operational control loop. It does
+not stop at displaying impact: it turns DataHub metadata into explicit control
+attempts and then contributes the results back to the context available to the
+organization. The project extends DataHub rather than rebuilding its lineage or
+catalog capabilities.
+
+## Demo and technical execution
+
+The recorded terminal demonstration is explicitly labeled **OFFLINE FIXTURE
+MODE**. It uses deterministic local lineage, mocked HTTP transport, and an
+in-memory document recorder so every displayed receipt is reproducible. The
+test suite separately exercises genuine MCP/JSON-RPC exchanges against an
+in-process FastMCP server, including pagination, structured-property mapping,
+control failures, authentication, and `save_document` arguments.
+
+A live MCP adapter and opt-in live test are included. Live persistence was not
+run in the development environment because no live DataHub deployment was
+available; a skipped live test is not presented as proof.
+
+## Event integration boundary
+
+The current FastAPI route accepts an authenticated Aftershock-normalized
+envelope. In production, a custom DataHub Action would translate an
+`incidentInfo` MetadataChangeLogEvent into that contract. The adapter is a
+documented next integration step and is not included in the current MVP.
+
+## Current limit and next step
+
+The MVP proves system-level exposure discovery and compensating-control
+receipts. Lineage does not establish which individual records a downstream
+system read or which external actions followed. The proposed Action-Provenance
+Ledger would add stable action IDs, incident windows, coverage evidence, and
+append-only compensation receipts for more selective recovery.
+
+## Built with
+
+Python 3.12, DataHub MCP Server, FastMCP, FastAPI, HTTPX, Rich, and pytest.
