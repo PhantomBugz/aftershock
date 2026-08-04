@@ -23,8 +23,11 @@ version-specific Quickstart command. Confirm that GMS is reachable and note
 its base URL and, when authentication is enabled, its token.
 
 The official [DataHub MCP guide](https://docs.datahub.com/docs/features/feature-guides/mcp)
-describes server requirements and mutation support. `save_document` must be
-available and mutations must be enabled for the write-back proof gate.
+describes server requirements and mutation support. With
+`mcp-server-datahub==0.6.0`, `save_document` requires DataHub OSS 1.4.0 or
+newer, or DataHub Cloud 0.3.16 or newer. Before bootstrap or the live proof
+gate, verify the target version, confirm that `save_document` is available,
+and confirm that MCP mutation tools are enabled.
 
 ## 3. Define and seed the demo metadata
 
