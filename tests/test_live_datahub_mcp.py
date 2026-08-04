@@ -10,8 +10,12 @@ from typing import Any
 
 import pytest
 
-from blast_radius_mapper import BlastRadiusMapper
-from datahub_context import MCPDataHubContext, build_datahub_context_from_env
+from blast_radius_mapper import BlastRadiusMapper, BlastRadiusMappingError
+from datahub_context import (
+    DataHubMCPError,
+    MCPDataHubContext,
+    build_datahub_context_from_env,
+)
 from remediation_models import ActionableTarget
 
 
@@ -31,6 +35,17 @@ JOB_URN = (
 DOCUMENT_URN = "urn:li:document:aftershock-live-contract-test"
 LIVE_INDEX_TIMEOUT_SECONDS = 30.0
 LIVE_INDEX_POLL_INTERVAL_SECONDS = 1.0
+EXPECTED_BUSINESS_ACTION = "ISSUE_PO"
+EXPECTED_REMEDIATION_WEBHOOK = (
+    "http://127.0.0.1:8765/remediate/cancel_po"
+)
+
+
+def _index_deadline_error(timeout_seconds: float) -> AssertionError:
+    return AssertionError(
+        f"timed out after {timeout_seconds:g}s waiting for seeded "
+        "DataJob and both Aftershock structured properties through MCP"
+    )
 
 
 async def wait_for_seeded_playbook(
@@ -52,26 +67,38 @@ async def wait_for_seeded_playbook(
     mapper = mapper_factory(context)
     deadline = monotonic() + timeout_seconds
     while True:
-        targets = await mapper.get_targets(DATASET_URN)
-        job = next(
-            (
-                target
-                for target in targets
-                if target.urn == JOB_URN
-                and bool(target.business_action)
-                and bool(target.remediation_webhook)
-            ),
-            None,
-        )
-        if job is not None:
-            return job
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise _index_deadline_error(timeout_seconds)
+
+        try:
+            targets = await asyncio.wait_for(
+                mapper.get_targets(DATASET_URN),
+                timeout=remaining,
+            )
+        except TimeoutError:
+            raise _index_deadline_error(timeout_seconds) from None
+        except (DataHubMCPError, BlastRadiusMappingError):
+            targets = None
+
+        if targets is not None:
+            job = next(
+                (
+                    target
+                    for target in targets
+                    if target.urn == JOB_URN
+                    and target.business_action == EXPECTED_BUSINESS_ACTION
+                    and target.remediation_webhook
+                    == EXPECTED_REMEDIATION_WEBHOOK
+                ),
+                None,
+            )
+            if job is not None:
+                return job
 
         remaining = deadline - monotonic()
         if remaining <= 0:
-            raise AssertionError(
-                f"timed out after {timeout_seconds:g}s waiting for seeded "
-                "DataJob and both Aftershock structured properties through MCP"
-            )
+            raise _index_deadline_error(timeout_seconds)
         await sleep(min(poll_interval_seconds, remaining))
 
 
@@ -84,11 +111,8 @@ def test_live_mcp_discovers_seeded_playbook_and_persists_document() -> None:
 
     job = asyncio.run(wait_for_seeded_playbook(context))
 
-    assert job.business_action == "ISSUE_PO"
-    assert (
-        job.remediation_webhook
-        == "http://127.0.0.1:8765/remediate/cancel_po"
-    )
+    assert job.business_action == EXPECTED_BUSINESS_ACTION
+    assert job.remediation_webhook == EXPECTED_REMEDIATION_WEBHOOK
 
     result = asyncio.run(
         context.save_document(
