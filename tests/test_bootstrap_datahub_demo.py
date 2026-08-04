@@ -15,6 +15,7 @@ import pytest
 from datahub.api.entities.structuredproperties.structuredproperties import (
     StructuredProperties,
 )
+from datahub.ingestion.graph.config import DatahubClientConfig
 from datahub.sdk import DataFlow, DataJob, Dataset
 
 
@@ -228,10 +229,15 @@ def test_apply_defines_properties_then_upserts_three_assets_and_one_exact_edge()
         ),
         "url": "http://localhost:8080",
     }
-    assert events[1][1] == {
-        "server": "http://localhost:8080",
-        "token": "DO-NOT-PRINT-ME",
-    }
+    client_kwargs = events[1][1]
+    assert set(client_kwargs) == {"config"}
+    client_config = client_kwargs["config"]
+    assert isinstance(client_config, DatahubClientConfig)
+    assert client_config.server == "http://localhost:8080"
+    assert client_config.token == "DO-NOT-PRINT-ME"
+    assert client_config.timeout_sec == bootstrap.SDK_REQUEST_TIMEOUT_SECONDS
+    assert client_config.retry_max_times == bootstrap.SDK_RETRY_MAX_TIMES
+    assert client_config.retry_status_codes == bootstrap.SDK_RETRY_STATUS_CODES
 
     upserted = [event[1] for event in events if event[0] == "upsert"]
     assert [type(entity) for entity in upserted] == [Dataset, DataFlow, DataJob]
@@ -266,6 +272,155 @@ def test_cli_requires_exactly_one_mode() -> None:
 
     assert parser.parse_args(["--dry-run"]).dry_run is True
     assert parser.parse_args(["--apply"]).apply is True
+
+
+def test_definition_cli_has_a_hard_timeout_and_hides_timeout_output(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    bootstrap = _bootstrap_module()
+    sentinel = "SECRET-FROM-TIMED-OUT-CLI"
+    observed: dict[str, Any] = {}
+
+    def timed_out_run(*args: Any, **kwargs: Any) -> object:
+        observed.update(kwargs)
+        raise subprocess.TimeoutExpired(
+            cmd=args[0],
+            timeout=kwargs["timeout"],
+            output=sentinel,
+            stderr=sentinel,
+        )
+
+    monkeypatch.setattr(bootstrap.subprocess, "run", timed_out_run)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        bootstrap.execute_bootstrap(
+            mode="apply",
+            environ={
+                "DATAHUB_GMS_URL": "http://localhost:8080",
+                "DATAHUB_GMS_TOKEN": sentinel,
+            },
+            client_factory=lambda **kwargs: pytest.fail(
+                "client must not be constructed after definition timeout"
+            ),
+        )
+
+    assert observed["timeout"] == bootstrap.DEFINITION_CLI_TIMEOUT_SECONDS
+    assert str(exc_info.value) == "structured-property definition upsert failed"
+    assert sentinel not in str(exc_info.value)
+    captured = capsys.readouterr()
+    assert sentinel not in captured.out
+    assert sentinel not in captured.err
+
+
+@pytest.mark.parametrize(
+    ("failure_stage", "expected_message"),
+    [
+        ("definitions", "structured-property definition upsert failed"),
+        ("client", "DataHub client creation failed"),
+        ("dataset", "DataHub Dataset upsert failed"),
+        ("flow", "DataHub DataFlow upsert failed"),
+        ("job", "DataHub DataJob upsert failed"),
+        ("lineage", "DataHub lineage creation failed"),
+    ],
+)
+def test_apply_wraps_each_third_party_failure_without_leaking_details(
+    failure_stage: str,
+    expected_message: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    bootstrap = _bootstrap_module()
+    sentinel = f"SECRET-FAILURE-{failure_stage}"
+
+    class Entities:
+        def upsert(self, entity: object) -> None:
+            stage_by_type = {
+                Dataset: "dataset",
+                DataFlow: "flow",
+                DataJob: "job",
+            }
+            if failure_stage == stage_by_type[type(entity)]:
+                raise RuntimeError(sentinel)
+
+    class Lineage:
+        def add_lineage(self, **kwargs: object) -> None:
+            if failure_stage == "lineage":
+                raise RuntimeError(sentinel)
+
+    class Client:
+        entities = Entities()
+        lineage = Lineage()
+
+    def client_factory(**kwargs: Any) -> Client:
+        if failure_stage == "client":
+            raise RuntimeError(sentinel)
+        return Client()
+
+    def definitions_runner(*args: Any, **kwargs: Any) -> None:
+        if failure_stage == "definitions":
+            raise RuntimeError(sentinel)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        bootstrap.execute_bootstrap(
+            mode="apply",
+            environ={
+                "DATAHUB_GMS_URL": "http://localhost:8080",
+                "DATAHUB_GMS_TOKEN": sentinel,
+            },
+            client_factory=client_factory,
+            definitions_runner=definitions_runner,
+        )
+
+    assert str(exc_info.value) == expected_message
+    assert sentinel not in str(exc_info.value)
+    captured = capsys.readouterr()
+    assert sentinel not in captured.out
+    assert sentinel not in captured.err
+
+
+@pytest.mark.parametrize(
+    "fatal",
+    [KeyboardInterrupt(), SystemExit(23)],
+    ids=["keyboard-interrupt", "system-exit"],
+)
+def test_apply_does_not_wrap_process_control_base_exceptions(
+    fatal: BaseException,
+) -> None:
+    bootstrap = _bootstrap_module()
+
+    def client_factory(**kwargs: Any) -> object:
+        raise fatal
+
+    with pytest.raises(type(fatal)):
+        bootstrap.execute_bootstrap(
+            mode="apply",
+            environ={"DATAHUB_GMS_URL": "http://localhost:8080"},
+            client_factory=client_factory,
+            definitions_runner=lambda *args, **kwargs: None,
+        )
+
+
+def test_cli_suppresses_unexpected_exception_details_and_tracebacks(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    bootstrap = _bootstrap_module()
+    sentinel = "SECRET-UNEXPECTED-CLI-FAILURE"
+
+    def fail(**kwargs: Any) -> dict[str, object]:
+        raise RuntimeError(sentinel)
+
+    monkeypatch.setattr(bootstrap, "execute_bootstrap", fail)
+
+    with pytest.raises(SystemExit) as exc_info:
+        bootstrap.main(["--apply"])
+
+    assert exc_info.value.code == 2
+    captured = capsys.readouterr()
+    assert sentinel not in captured.out
+    assert sentinel not in captured.err
+    assert "Traceback" not in captured.err
+    assert "DataHub bootstrap failed" in captured.err
 
 
 def test_cli_dry_run_emits_only_deterministic_json() -> None:

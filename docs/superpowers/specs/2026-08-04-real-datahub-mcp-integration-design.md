@@ -64,6 +64,14 @@ Live MCP transport supports:
 
 Secrets must never be printed or committed.
 
+The live bootstrap is bounded: the structured-property CLI subprocess has a
+hard 30-second timeout, while DataHub SDK calls use a 10-second request timeout
+and at most one retry for the configured transient HTTP statuses. Every apply
+stage converts third-party exceptions into fixed, secret-safe errors while
+allowing process-control exceptions to propagate. The opt-in live proof polls
+for the seeded DataJob and both playbook properties only within a fixed
+monotonic deadline; it never falls back to fixture data.
+
 ## DataHub Metadata Contract
 
 Actionable entities use two structured properties:

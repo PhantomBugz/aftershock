@@ -311,9 +311,9 @@ Expected: setup artifacts do not exist.
 
 - [ ] **Step 3: Implement setup artifacts**
 
-The script must support `--dry-run` and `--apply`, create demo assets using `acryl-datahub`, attach the two structured properties, and add supported lineage. It must require `DATAHUB_GMS_URL` for `--apply` and never print `DATAHUB_GMS_TOKEN`.
+The script must support `--dry-run` and `--apply`, create demo assets using `acryl-datahub`, attach the two structured properties, and add supported lineage. It must require `DATAHUB_GMS_URL` for `--apply` and never print `DATAHUB_GMS_TOKEN`. Bound the definition CLI subprocess with a hard timeout, configure the SDK's request timeout and retry limit directly, and convert every third-party apply-stage exception into fixed secret-safe output without catching process-control exceptions.
 
-Add an integration test marked `live_datahub` and skipped unless `RUN_LIVE_DATAHUB_TESTS=1`; it must execute real MCP lineage and `save_document` and assert a returned document URN.
+Add an integration test marked `live_datahub` and skipped unless `RUN_LIVE_DATAHUB_TESTS=1`; it must execute real MCP lineage and `save_document` and assert a returned document URN. Its index-propagation poll must use a bounded monotonic deadline and wait for the seeded DataJob plus both structured properties without any fixture fallback.
 
 - [ ] **Step 4: Write rule-accurate documentation**
 

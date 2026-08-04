@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from datahub.errors import ExperimentalWarning
+from datahub.ingestion.graph.config import DatahubClientConfig
 
 with warnings.catch_warnings():
     warnings.simplefilter("ignore", ExperimentalWarning)
@@ -21,6 +22,11 @@ with warnings.catch_warnings():
 Mode = Literal["dry-run", "apply"]
 ClientFactory = Callable[..., Any]
 DefinitionsRunner = Callable[[tuple[str, ...], dict[str, str]], None]
+
+DEFINITION_CLI_TIMEOUT_SECONDS = 30.0
+SDK_REQUEST_TIMEOUT_SECONDS = 10.0
+SDK_RETRY_MAX_TIMES = 1
+SDK_RETRY_STATUS_CODES = [429, 500, 502, 503, 504]
 
 ROOT = Path(__file__).resolve().parents[1]
 PROPERTY_FILE = ROOT / "config" / "aftershock_structured_properties.yaml"
@@ -42,6 +48,10 @@ REMEDIATION_WEBHOOK_PROPERTY_URN = (
 # This loopback URL is deliberately safe for setup. It becomes callable only
 # if the operator separately starts a local demo remediation receiver.
 DEMO_REMEDIATION_URL = "http://127.0.0.1:8765/remediate/cancel_po"
+
+
+class BootstrapError(RuntimeError):
+    """A controlled bootstrap failure that never contains third-party detail."""
 
 
 def build_demo_assets() -> tuple[Dataset, DataFlow, DataJob]:
@@ -106,13 +116,14 @@ def _run_definitions(
             capture_output=True,
             text=True,
             env=environ,
+            timeout=DEFINITION_CLI_TIMEOUT_SECONDS,
         )
-    except OSError:
-        raise RuntimeError(
+    except (OSError, subprocess.TimeoutExpired):
+        raise BootstrapError(
             "structured-property definition command could not be started"
         ) from None
     if completed.returncode != 0:
-        raise RuntimeError(
+        raise BootstrapError(
             "structured-property definition upsert failed"
         )
 
@@ -139,21 +150,50 @@ def execute_bootstrap(
     if not gms_url:
         raise ValueError("DATAHUB_GMS_URL must be set for --apply")
 
-    definitions_runner(
-        _definition_command(absolute_path=True),
-        source,
-    )
-    client = client_factory(
-        server=gms_url,
-        token=source.get("DATAHUB_GMS_TOKEN"),
-    )
-    dataset, flow, job = build_demo_assets()
-    for entity in (dataset, flow, job):
-        client.entities.upsert(entity)
-    client.lineage.add_lineage(
-        upstream=DATASET_URN,
-        downstream=JOB_URN,
-    )
+    try:
+        definitions_runner(
+            _definition_command(absolute_path=True),
+            source,
+        )
+    except Exception:
+        raise BootstrapError(
+            "structured-property definition upsert failed"
+        ) from None
+
+    try:
+        client_config = DatahubClientConfig(
+            server=gms_url,
+            token=source.get("DATAHUB_GMS_TOKEN"),
+            timeout_sec=SDK_REQUEST_TIMEOUT_SECONDS,
+            retry_max_times=SDK_RETRY_MAX_TIMES,
+            retry_status_codes=list(SDK_RETRY_STATUS_CODES),
+        )
+        client = client_factory(config=client_config)
+    except Exception:
+        raise BootstrapError("DataHub client creation failed") from None
+
+    try:
+        dataset, flow, job = build_demo_assets()
+    except Exception:
+        raise BootstrapError("DataHub demo asset construction failed") from None
+
+    for label, entity in (
+        ("Dataset", dataset),
+        ("DataFlow", flow),
+        ("DataJob", job),
+    ):
+        try:
+            client.entities.upsert(entity)
+        except Exception:
+            raise BootstrapError(f"DataHub {label} upsert failed") from None
+
+    try:
+        client.lineage.add_lineage(
+            upstream=DATASET_URN,
+            downstream=JOB_URN,
+        )
+    except Exception:
+        raise BootstrapError("DataHub lineage creation failed") from None
     return _plan(mode)
 
 
@@ -184,8 +224,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     mode: Mode = "apply" if args.apply else "dry-run"
     try:
         result = execute_bootstrap(mode=mode)
-    except (RuntimeError, ValueError) as exc:
+    except (BootstrapError, ValueError) as exc:
         parser.error(str(exc))
+    except Exception:
+        parser.error("DataHub bootstrap failed")
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
 
