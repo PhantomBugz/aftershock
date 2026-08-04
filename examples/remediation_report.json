@@ -1,0 +1,38 @@
+{
+  "context_mode": "fixture",
+  "counts": {
+    "failed": 0,
+    "skipped": 0,
+    "succeeded": 2
+  },
+  "dataset_urn": "urn:li:dataset:(urn:li:dataPlatform:postgres,inventory_pricing,PROD)",
+  "incident_id": "INC-9942",
+  "receipts": [
+    {
+      "business_action": "ISSUE_PO",
+      "endpoint": "https://api.internal.example/remediate/cancel_po",
+      "entity_type": "DATA_JOB",
+      "error": null,
+      "http_status": 200,
+      "incident_id": "INC-9942",
+      "status": "succeeded",
+      "target_urn": "urn:li:dataJob:(urn:li:dataFlow:(airflow,aftershock_demo,PROD),purchase_order_generator)"
+    },
+    {
+      "business_action": "ADJUST_PRICE",
+      "endpoint": "https://api.internal.example/remediate/revert_pricing",
+      "entity_type": "ML_MODEL",
+      "error": null,
+      "http_status": 200,
+      "incident_id": "INC-9942",
+      "status": "succeeded",
+      "target_urn": "urn:li:mlModel:(urn:li:dataPlatform:sagemaker,dynamic_pricing_model,PROD)"
+    }
+  ],
+  "timestamp": "2026-08-04T12:00:00Z",
+  "writeback": {
+    "document_urn": "urn:li:document:aftershock-incident-inc-9942-340f1a234b21d12d2e9c81ae4a2f0c13",
+    "error": null,
+    "status": "succeeded"
+  }
+}

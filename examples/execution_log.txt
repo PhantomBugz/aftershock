@@ -1,0 +1,46 @@
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ OFFLINE FIXTURE MODE                                                                                    │
+│ Lineage responses, remediation endpoints, and document write-back use deterministic local test doubles. │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌──────────────────── ACT 1  //  THE FAULT ────────────────────┐
+│                                                              │
+│   CRITICAL INCIDENT DETECTED                                 │
+│                                                              │
+│   "Pricing Decimal Shift" identified in inventory_pricing.   │
+│   Aftershock normalized incident envelope received.          │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+ACT 2  //  FULL WORKFLOW EXECUTION
+Context read contract: get_lineage(upstream=false) (fixture response)
+This step performs lineage discovery, control processing, and the incident-record write-back.
+  Executing full workflow: lineage + controls + save_document... ------------------------------------
+┌───────────────────────────────────────────── RECORDED BLAST-RADIUS VIEW ─────────────────────────────────────────────┐
+│ urn:li:dataset:(urn:li:dataPlatform:postgres,inventory_pricing,PROD) (CORRUPTED SOURCE)                              │
+│ ├── DATA_JOB urn:li:dataJob:(urn:li:dataFlow:(airflow,aftershock_demo,PROD),purchase_order_generator)                │
+│ │   └── Business action: ISSUE_PO                                                                                    │
+│ └── ML_MODEL urn:li:mlModel:(urn:li:dataPlatform:sagemaker,dynamic_pricing_model,PROD)                               │
+│     └── Business action: ADJUST_PRICE                                                                                │
+└────────────────────────────── Retrospective view from the completed workflow receipts ───────────────────────────────┘
+ACT 3  //  RECORDED CONTROL RECEIPTS
+Control processing occurred during the full workflow above; this is a retrospective receipt view.
+                                             Compensating-control receipts                                              
+┌──────────┬───────────────────────────────────────┬───────────┬──────┬────────────────────────────────────────┬───────┐
+│ Type     │ Target / action                       │ Status    │ HTTP │ Endpoint                               │ Error │
+├──────────┼───────────────────────────────────────┼───────────┼──────┼────────────────────────────────────────┼───────┤
+│ DATA_JOB │ urn:li:dataJob:(urn:li:dataFlow:(air… │ succeeded │ 200  │ https://api.internal.example/remediat… │ —     │
+│          │ ISSUE_PO                              │           │      │                                        │       │
+├──────────┼───────────────────────────────────────┼───────────┼──────┼────────────────────────────────────────┼───────┤
+│ ML_MODEL │ urn:li:mlModel:(urn:li:dataPlatform:… │ succeeded │ 200  │ https://api.internal.example/remediat… │ —     │
+│          │ ADJUST_PRICE                          │           │      │                                        │       │
+└──────────┴───────────────────────────────────────┴───────────┴──────┴────────────────────────────────────────┴───────┘
+Receipt 1 endpoint: https://api.internal.example/remediate/cancel_po
+Receipt 1 error: —
+Receipt 2 endpoint: https://api.internal.example/remediate/revert_pricing
+Receipt 2 error: —
+Recorded write-back status: succeeded (in-memory fixture recorder)
+Saved document URN: urn:li:document:aftershock-incident-inc-9942-340f1a234b21d12d2e9c81ae4a2f0c13
+┌─────────────────────────────── ACT 4  //  RESOLUTION ───────────────────────────────┐
+│                                                                                     │
+│   COMPLETED: all discovered controls succeeded and the incident record was saved.   │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
