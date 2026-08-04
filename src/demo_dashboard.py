@@ -1,94 +1,141 @@
-"""Rich terminal showpiece for the complete Aftershock incident lifecycle."""
+"""Truthful Rich dashboard for the complete Aftershock incident workflow."""
 
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+from collections.abc import Callable
+from datetime import datetime
 
 import httpx
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn
+from rich.table import Table
 from rich.tree import Tree
 
-from blast_radius_mapper import BlastRadiusMapper
 from compensating_action_engine import CompensatingActionEngine
-from datahub_context import FixtureDataHubContext
-from remediation_models import ActionableTarget, RemediationReceipt
+from datahub_context import DataHubContextPort, FixtureDataHubContext
+from incident_processor import AftershockIncidentProcessor
+from remediation_models import IncidentReport
 
 
 DEMO_DATASET_URN = (
     "urn:li:dataset:(urn:li:dataPlatform:postgres,inventory_pricing,PROD)"
 )
 DEMO_INCIDENT_ID = "INC-9942"
+Clock = Callable[[], datetime]
 
 
-def _build_blast_radius_tree(
-    targets: Sequence[ActionableTarget],
-) -> Tree:
+def _safe(value: object | None) -> str:
+    return escape("—" if value is None else str(value))
+
+
+def _build_blast_radius_tree(report: IncidentReport) -> Tree:
     tree = Tree(
-        "[bold red]inventory_pricing[/] [red](CORRUPTED SOURCE)[/]",
+        f"[bold red]{_safe(report.dataset_urn)}[/] [red](CORRUPTED SOURCE)[/]",
         guide_style="bold red",
     )
-
-    labels = {
-        "DATA_JOB": ("Airflow Job", "purchase_order_generator"),
-        "ML_MODEL": ("SageMaker Model", "dynamic_pricing_model"),
-    }
-    for target in targets:
-        entity_type = target.entity_type
-        system_label, fallback_name = labels.get(
-            entity_type, (entity_type.replace("_", " ").title(), "downstream_system")
+    for receipt in report.receipts:
+        branch = tree.add(
+            f"[bold yellow]{_safe(receipt.entity_type)}[/] "
+            f"[white]{_safe(receipt.target_urn)}[/]"
         )
-        action = target.business_action or "UNDEFINED"
-        tree.add(
-            f"[bold yellow]{system_label}[/] [white]{fallback_name}[/]\n"
-            f"[dim]Action:[/] [bold bright_magenta]{action}[/]"
-        )
-
+        branch.add(f"Business action: [magenta]{_safe(receipt.business_action)}[/]")
     return tree
+
+
+def _receipt_table(report: IncidentReport) -> Table:
+    table = Table(title="Compensating-control receipts", show_lines=True)
+    table.add_column("Type")
+    table.add_column("Target / action")
+    table.add_column("Status")
+    table.add_column("HTTP")
+    table.add_column("Endpoint")
+    for receipt in report.receipts:
+        table.add_row(
+            _safe(receipt.entity_type),
+            f"{_safe(receipt.target_urn)}\n{_safe(receipt.business_action)}",
+            _safe(receipt.status),
+            _safe(receipt.http_status),
+            _safe(receipt.endpoint),
+        )
+    return table
+
+
+def _is_complete(report: IncidentReport) -> bool:
+    return (
+        all(receipt.status == "succeeded" for receipt in report.receipts)
+        and report.writeback.status == "succeeded"
+    )
+
+
+async def _pause(delay: float) -> None:
+    if delay > 0:
+        await asyncio.sleep(delay)
 
 
 async def run_demo(
     *,
     console: Console | None = None,
+    context: DataHubContextPort | None = None,
     http_client: httpx.AsyncClient | None = None,
+    clock: Clock | None = None,
     delay: float = 1.5,
-) -> list[RemediationReceipt]:
-    """Render four acts while executing the real compensating-action engine."""
+) -> IncidentReport:
+    """Render a receipt-driven workflow and return the exact displayed report."""
 
     active_console = console or Console()
-    mapper = BlastRadiusMapper(FixtureDataHubContext())
-    targets = await mapper.get_targets(DEMO_DATASET_URN)
+    active_context = context or FixtureDataHubContext()
+    fixture_mode = active_context.mode == "fixture"
+    if not fixture_mode and http_client is None:
+        raise ValueError("http_client is required for non-fixture context")
+
+    if fixture_mode:
+        active_console.print(
+            Panel.fit(
+                "[bold white]OFFLINE FIXTURE MODE[/]\n"
+                "Lineage responses, remediation endpoints, and document "
+                "write-back use deterministic local test doubles.",
+                border_style="bright_yellow",
+            )
+        )
+    else:
+        active_console.print(
+            Panel.fit(
+                "[bold white]MCP MODE[/]\n"
+                "Results shown below are the receipts returned by the "
+                "configured services.",
+                border_style="bright_cyan",
+            )
+        )
 
     active_console.print(
         Panel.fit(
             "[bold white]CRITICAL INCIDENT DETECTED[/]\n\n"
             '"[bold bright_red]Pricing Decimal Shift[/]" identified in '
             "[bold cyan]inventory_pricing[/].\n"
-            "[yellow]Webhook intercepted.[/]",
+            "[yellow]Aftershock normalized incident envelope received.[/]",
             title="[bold red]ACT 1  //  THE FAULT[/]",
             border_style="bright_red",
             padding=(1, 3),
         )
     )
-    await asyncio.sleep(delay)
+    await _pause(delay)
 
+    qualifier = " (fixture response)" if fixture_mode else " (configured MCP)"
     active_console.print(
-        Panel(
-            _build_blast_radius_tree(targets),
-            title="[bold yellow]ACT 2  //  BLAST RADIUS[/]",
-            subtitle="[dim]DataHub downstream lineage resolved[/]",
-            border_style="yellow",
-            padding=(1, 2),
-        )
+        "[bold yellow]ACT 2  //  DATAHUB CONTEXT AND BLAST RADIUS[/]\n"
+        f"Context read contract: [bold]get_lineage(upstream=false)[/]"
+        f"{qualifier}"
     )
-    await asyncio.sleep(delay)
 
-    async def execute_controls(
-        client: httpx.AsyncClient,
-    ) -> list[RemediationReceipt]:
-        engine = CompensatingActionEngine(http_client=client)
+    async def process(client: httpx.AsyncClient) -> IncidentReport:
+        processor = AftershockIncidentProcessor(
+            active_context,
+            CompensatingActionEngine(http_client=client),
+            clock=clock,
+        )
         with Progress(
             SpinnerColumn(style="bold bright_cyan"),
             TextColumn("[bold bright_cyan]{task.description}"),
@@ -96,46 +143,71 @@ async def run_demo(
             console=active_console,
             transient=False,
         ) as progress:
-            task_id = progress.add_task(
-                "Executing Compensating Controls...", total=1
-            )
-            results = await engine.process_blast_radius(
-                targets, incident_id=DEMO_INCIDENT_ID
-            )
+            task_id = progress.add_task("Executing incident processor...", total=1)
+            report = await processor.process(DEMO_INCIDENT_ID, DEMO_DATASET_URN)
             progress.update(task_id, completed=1)
-        return results
+        return report
 
-    active_console.print(
-        "\n[bold bright_cyan]ACT 3  //  THE AFTERSHOCK[/]",
-        justify="left",
-    )
     if http_client is not None:
-        results = await execute_controls(http_client)
+        report = await process(http_client)
     else:
 
-        async def remediation_service(request: httpx.Request) -> httpx.Response:
-            await asyncio.sleep(0.6)
-            active_console.print(
-                f"[green]HTTP 200[/]  POST [bold]{request.url.path}[/]"
-            )
-            return httpx.Response(200, json={"status": "accepted"})
+        async def fixture_remediation(_: httpx.Request) -> httpx.Response:
+            await asyncio.sleep(0.05)
+            return httpx.Response(200, json={"accepted": True})
 
-        transport = httpx.MockTransport(remediation_service)
-        async with httpx.AsyncClient(transport=transport, timeout=10.0) as client:
-            results = await execute_controls(client)
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(fixture_remediation), timeout=10.0
+        ) as owned_client:
+            report = await process(owned_client)
 
-    await asyncio.sleep(delay)
     active_console.print(
-        Panel.fit(
-            "[bold white]SUCCESS: Action Debt Neutralized.[/]\n\n"
-            "[bold bright_green]$120,000 in erroneous orders reversed.[/]\n"
-            "[white]Enterprise State Restored.[/]",
-            title="[bold bright_green]ACT 4  //  RESOLUTION[/]",
-            border_style="bright_green",
-            padding=(1, 4),
+        Panel(
+            _build_blast_radius_tree(report),
+            subtitle="[dim]Typed downstream entities returned by the workflow[/]",
+            border_style="yellow",
         )
     )
-    return results
+    await _pause(delay)
+
+    active_console.print("[bold bright_cyan]ACT 3  //  CONTROL RECEIPTS[/]")
+    active_console.print(_receipt_table(report))
+    for index, receipt in enumerate(report.receipts, start=1):
+        active_console.print(
+            f"Receipt {index} endpoint: {_safe(receipt.endpoint)}"
+        )
+    await _pause(delay)
+
+    writeback_note = (
+        " (in-memory fixture recorder)" if fixture_mode else " (MCP save_document receipt)"
+    )
+    active_console.print(
+        f"Write-back status: [bold]{_safe(report.writeback.status)}[/]"
+        f"{writeback_note}\n"
+        f"Saved document URN: {_safe(report.writeback.document_urn)}"
+    )
+
+    if _is_complete(report):
+        resolution = (
+            "[bold white]COMPLETED: all discovered controls succeeded and the "
+            "incident record was saved.[/]"
+        )
+        border = "bright_green"
+    else:
+        resolution = (
+            "[bold white]COMPLETED WITH ISSUES: inspect the control and "
+            "write-back receipts above.[/]"
+        )
+        border = "bright_yellow"
+    active_console.print(
+        Panel.fit(
+            resolution,
+            title="[bold]ACT 4  //  RESOLUTION[/]",
+            border_style=border,
+            padding=(1, 3),
+        )
+    )
+    return report
 
 
 if __name__ == "__main__":

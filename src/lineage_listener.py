@@ -1,72 +1,116 @@
-"""FastAPI receiver for DataHub incident webhook events."""
+"""FastAPI entrypoint for Aftershock-normalized incident envelopes."""
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+import logging
+from collections.abc import AsyncIterator, Callable
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, Response, status
-from pydantic import BaseModel, Field
+from fastapi import Depends, FastAPI, HTTPException, status
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from blast_radius_mapper import BlastRadiusMapper
+from blast_radius_mapper import BlastRadiusMappingError
 from compensating_action_engine import CompensatingActionEngine
+from datahub_context import (
+    DataHubConfigurationError,
+    DataHubMCPError,
+    build_datahub_context_from_env,
+)
+from incident_processor import AftershockIncidentProcessor
+from remediation_models import IncidentReport
 
 
-app = FastAPI(title="Aftershock Data Incident Listener", version="0.1.0")
+logger = logging.getLogger("Aftershock-Listener")
+app = FastAPI(title="Aftershock Incident Listener", version="0.2.0")
+_DATASET_URN_PREFIX = "urn:li:dataset:"
+_PROCESSING_UNAVAILABLE = "Aftershock incident processing unavailable"
+
+ProcessorSession = AbstractAsyncContextManager[AftershockIncidentProcessor]
+ProcessorSessionFactory = Callable[[], ProcessorSession]
 
 
-class DataHubIncident(BaseModel):
-    """Minimal incident envelope emitted by the DataHub Action webhook."""
+class AftershockIncidentEnvelope(BaseModel):
+    """Normalized Aftershock input; it is not a native DataHub event schema."""
 
-    incident_id: str = Field(min_length=1)
-    dataset_urn: str = Field(min_length=1)
-    severity: str = Field(min_length=1)
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    incident_id: str = Field(min_length=1, max_length=128)
+    dataset_urn: str = Field(min_length=1, max_length=2048)
+    severity: str = Field(min_length=1, max_length=32)
+
+    @field_validator("dataset_urn")
+    @classmethod
+    def require_dataset_urn(cls, value: str) -> str:
+        suffix = value[len(_DATASET_URN_PREFIX) :]
+        if not value.startswith(_DATASET_URN_PREFIX) or not suffix.strip():
+            raise ValueError("dataset_urn must be a DataHub dataset URN")
+        return value
 
 
-def get_blast_radius_mapper() -> BlastRadiusMapper:
-    """Provide the current DataHub graph adapter."""
+@asynccontextmanager
+async def _default_processor_session() -> AsyncIterator[AftershockIncidentProcessor]:
+    """Build and close one live or explicitly configured fixture session."""
 
-    return BlastRadiusMapper()
-
-
-async def get_compensating_action_engine(
-) -> AsyncIterator[CompensatingActionEngine]:
-    """Provide and close a request-scoped remediation engine."""
-
+    context = build_datahub_context_from_env()
     engine = CompensatingActionEngine()
     try:
-        yield engine
+        yield AftershockIncidentProcessor(context, engine)
     finally:
         await engine.aclose()
 
 
-@app.post("/webhook/datahub", status_code=status.HTTP_202_ACCEPTED)
-async def receive_datahub_incident(
-    incident: DataHubIncident,
-    response: Response,
-    mapper: Annotated[BlastRadiusMapper, Depends(get_blast_radius_mapper)],
-    engine: Annotated[
-        CompensatingActionEngine, Depends(get_compensating_action_engine)
+def get_processor_session_factory() -> ProcessorSessionFactory:
+    """Provide a lazy session factory so ignored envelopes touch no context."""
+
+    return _default_processor_session
+
+
+def _workflow_completed(processor_report: IncidentReport) -> bool:
+    return (
+        all(receipt.status == "succeeded" for receipt in processor_report.receipts)
+        and processor_report.writeback.status == "succeeded"
+    )
+
+
+@app.post("/webhook/datahub", status_code=status.HTTP_200_OK)
+async def receive_aftershock_incident(
+    incident: AftershockIncidentEnvelope,
+    session_factory: Annotated[
+        ProcessorSessionFactory, Depends(get_processor_session_factory)
     ],
 ) -> dict[str, object]:
-    """Map a DataHub incident to downstream compensation playbooks."""
+    """Process one normalized incident fully, including DataHub write-back."""
 
     if incident.severity.upper() != "CRITICAL":
-        response.status_code = status.HTTP_200_OK
         return {
             "status": "ignored",
             "incident_id": incident.incident_id,
             "message": "no action required",
         }
 
-    targets = await mapper.get_targets(incident.dataset_urn)
-    receipts = await engine.process_blast_radius(targets, incident.incident_id)
+    try:
+        async with session_factory() as processor:
+            report = await processor.process(
+                incident.incident_id, incident.dataset_urn
+            )
+    except (
+        DataHubConfigurationError,
+        DataHubMCPError,
+        BlastRadiusMappingError,
+    ):
+        # Tool details can contain server responses or secrets. Log and return
+        # only a controlled message, and never switch to fixture data.
+        logger.error("Aftershock incident processing failed before completion")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=_PROCESSING_UNAVAILABLE,
+        ) from None
+
+    response = report.to_dict()
     return {
-        "status": "accepted",
-        "incident_id": incident.incident_id,
-        "targets_found": len(targets),
-        "remediations_triggered": sum(
-            receipt.status == "succeeded" for receipt in receipts
+        "status": (
+            "completed" if _workflow_completed(report) else "completed_with_issues"
         ),
-        "results": [receipt.to_dict() for receipt in receipts],
+        **response,
     }
