@@ -23,8 +23,20 @@ test = [
   "pytest>=8.4,<9",
 ]
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.setuptools]
+package-dir = { "" = "src" }
+py-modules = [
+  "blast_radius_mapper",
+  "compensating_action_engine",
+  "datahub_context",
+  "demo_contract",
+  "demo_dashboard",
+  "demo_remediation_receiver",
+  "incident_processor",
+  "lineage_listener",
+  "live_demo",
+  "remediation_models",
+]
 
 [tool.pytest.ini_options]
 addopts = "-ra"

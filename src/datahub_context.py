@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
+import re
 import sys
+import unicodedata
 from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
+from urllib.parse import urlsplit
 
 import httpx
 from fastmcp import Client
@@ -18,9 +22,13 @@ from fastmcp.client.transports import StdioTransport, StreamableHttpTransport
 DEFAULT_FIXTURE_PATH = (
     Path(__file__).resolve().parents[1] / "mock-data" / "datahub_lineage.json"
 )
-_PAGE_SIZE = 100
 _MAX_LINEAGE_PAGES = 100
 _MAX_LINEAGE_RESULTS = 10_000
+_MAX_DOCUMENT_SEARCH_RESULTS = 50
+_MAX_GREP_DOCUMENTS = 50
+_MAX_GREP_PATTERN_LENGTH = 4_096
+_MAX_GREP_CONTEXT_CHARS = 8_000
+_MAX_GREP_MATCHES_PER_DOCUMENT = 20
 _CLIENT_TIMEOUT_SECONDS = 30.0
 _CLIENT_INIT_TIMEOUT_SECONDS = 10.0
 _PRESERVED_SUBPROCESS_ENV = (
@@ -69,6 +77,26 @@ class DataHubContextPort(Protocol):
         self, urns: Sequence[str]
     ) -> list[dict[str, Any]]:
         """Return entity details for a batch of URNs."""
+
+    async def search_documents(
+        self,
+        *,
+        query: str,
+        num_results: int = 10,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """Return validated DataHub document search metadata."""
+
+    async def grep_documents(
+        self,
+        *,
+        urns: Sequence[str],
+        pattern: str,
+        context_chars: int = 200,
+        max_matches_per_doc: int = 5,
+        start_offset: int = 0,
+    ) -> dict[str, Any]:
+        """Return validated excerpts from DataHub document content."""
 
     async def save_document(
         self,
@@ -180,7 +208,10 @@ class MCPDataHubContext:
                     "urn": dataset_urn,
                     "upstream": False,
                     "max_hops": 3,
-                    "max_results": _PAGE_SIZE,
+                    # mcp-server-datahub 0.6.0 fetches from GraphQL at start=0
+                    # before applying ``offset``. Fetch the full bounded set so
+                    # later offset pages cannot be hidden by the server cap.
+                    "max_results": _MAX_LINEAGE_RESULTS,
                     "offset": offset,
                 },
             )
@@ -266,6 +297,63 @@ class MCPDataHubContext:
             return payload
         raise _tool_error("get_entities", "returned an unsupported payload")
 
+    async def search_documents(
+        self,
+        *,
+        query: str,
+        num_results: int = 10,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """Search document metadata through the pinned DataHub MCP tool."""
+
+        _validate_document_search_arguments(query, num_results, offset)
+        payload = await self._call_tool(
+            "search_documents",
+            {
+                "query": query,
+                "num_results": num_results,
+                "offset": offset,
+            },
+        )
+        return _validated_document_search_payload(
+            payload,
+            expected_offset=offset,
+            requested_count=num_results,
+        )
+
+    async def grep_documents(
+        self,
+        *,
+        urns: Sequence[str],
+        pattern: str,
+        context_chars: int = 200,
+        max_matches_per_doc: int = 5,
+        start_offset: int = 0,
+    ) -> dict[str, Any]:
+        """Search document content through the pinned DataHub MCP tool."""
+
+        document_urns = _validate_grep_arguments(
+            urns,
+            pattern,
+            context_chars,
+            max_matches_per_doc,
+            start_offset,
+        )
+        payload = await self._call_tool(
+            "grep_documents",
+            {
+                "urns": document_urns,
+                "pattern": pattern,
+                "context_chars": context_chars,
+                "max_matches_per_doc": max_matches_per_doc,
+                "start_offset": start_offset,
+            },
+        )
+        return _validated_grep_documents_payload(
+            payload,
+            minimum_position=start_offset,
+        )
+
     async def save_document(
         self,
         *,
@@ -277,15 +365,17 @@ class MCPDataHubContext:
     ) -> dict[str, Any]:
         """Persist a DataHub document without sending unseeded topic tags."""
 
+        arguments: dict[str, Any] = {
+            "document_type": document_type,
+            "title": title,
+            "content": content,
+            "related_assets": list(related_assets),
+        }
+        if urn is not None:
+            arguments["urn"] = urn
         payload = await self._call_tool(
             "save_document",
-            {
-                "document_type": document_type,
-                "title": title,
-                "content": content,
-                "urn": urn,
-                "related_assets": list(related_assets),
-            },
+            arguments,
         )
         if not isinstance(payload, dict):
             raise _tool_error("save_document", "returned an unsupported payload")
@@ -366,6 +456,201 @@ def _is_nonnegative_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
+def _is_document_urn(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and value.startswith("urn:li:document:")
+        and len(value) > len("urn:li:document:")
+        and not any(
+            character.isspace()
+            or unicodedata.category(character).startswith("C")
+            for character in value
+        )
+    )
+
+
+def _validate_document_search_arguments(
+    query: object,
+    num_results: object,
+    offset: object,
+) -> None:
+    if (
+        not isinstance(query, str)
+        or not query.strip()
+        or not _is_nonnegative_int(num_results)
+        or not 1 <= num_results <= _MAX_DOCUMENT_SEARCH_RESULTS
+        or not _is_nonnegative_int(offset)
+    ):
+        raise _tool_error("search_documents", "received invalid arguments")
+
+
+def _validated_document_search_payload(
+    payload: object,
+    *,
+    expected_offset: int,
+    requested_count: int,
+) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise _tool_error("search_documents", "returned an unsupported payload")
+
+    normalized = deepcopy(payload)
+    if "searchResults" not in payload:
+        total = payload.get("total")
+        count = payload.get("count")
+        if (
+            not _is_nonnegative_int(total)
+            or expected_offset < total
+            or ("count" in payload and count != requested_count)
+        ):
+            raise _tool_error(
+                "search_documents", "returned invalid search metadata"
+            )
+        normalized["searchResults"] = []
+
+    search_results = normalized.get("searchResults")
+    if not isinstance(search_results, list):
+        raise _tool_error("search_documents", "returned invalid search metadata")
+    if len(search_results) > requested_count:
+        raise _tool_error("search_documents", "returned invalid search metadata")
+
+    seen_urns: set[str] = set()
+    for result in search_results:
+        if not isinstance(result, Mapping):
+            raise _tool_error(
+                "search_documents", "returned invalid search metadata"
+            )
+        entity = result.get("entity")
+        if not isinstance(entity, Mapping):
+            raise _tool_error(
+                "search_documents", "returned invalid search metadata"
+            )
+        urn = entity.get("urn")
+        info = entity.get("info")
+        title = info.get("title") if isinstance(info, Mapping) else None
+        if (
+            not _is_document_urn(urn)
+            or urn in seen_urns
+            or not isinstance(title, str)
+            or not title.strip()
+        ):
+            raise _tool_error(
+                "search_documents", "returned invalid search metadata"
+            )
+        seen_urns.add(urn)
+
+    start = normalized.get("start")
+    count = normalized.get("count")
+    total = normalized.get("total")
+    if "start" in normalized and (
+        not _is_nonnegative_int(start) or start != expected_offset
+    ):
+        raise _tool_error("search_documents", "returned invalid search metadata")
+    if "count" in normalized and (
+        not _is_nonnegative_int(count) or count != requested_count
+    ):
+        raise _tool_error("search_documents", "returned invalid search metadata")
+    if "total" in normalized and (
+        not _is_nonnegative_int(total)
+        or (
+            bool(search_results)
+            and total < expected_offset + len(search_results)
+        )
+        or (not search_results and expected_offset < total)
+    ):
+        raise _tool_error("search_documents", "returned invalid search metadata")
+    return normalized
+
+
+def _validate_grep_arguments(
+    urns: object,
+    pattern: object,
+    context_chars: object,
+    max_matches_per_doc: object,
+    start_offset: object,
+) -> list[str]:
+    if (
+        not isinstance(urns, Sequence)
+        or isinstance(urns, (str, bytes))
+        or not 1 <= len(urns) <= _MAX_GREP_DOCUMENTS
+        or not all(_is_document_urn(urn) for urn in urns)
+        or not isinstance(pattern, str)
+        or not pattern
+        or len(pattern) > _MAX_GREP_PATTERN_LENGTH
+        or not _is_nonnegative_int(context_chars)
+        or context_chars > _MAX_GREP_CONTEXT_CHARS
+        or not _is_nonnegative_int(max_matches_per_doc)
+        or not 1 <= max_matches_per_doc <= _MAX_GREP_MATCHES_PER_DOCUMENT
+        or not _is_nonnegative_int(start_offset)
+    ):
+        raise _tool_error("grep_documents", "received invalid arguments")
+    return list(urns)
+
+
+def _validated_grep_documents_payload(
+    payload: object,
+    *,
+    minimum_position: int,
+) -> dict[str, Any]:
+    if not isinstance(payload, dict) or "error" in payload:
+        raise _tool_error("grep_documents", "returned an unsupported payload")
+
+    results = payload.get("results")
+    total_matches = payload.get("total_matches")
+    documents_with_matches = payload.get("documents_with_matches")
+    if (
+        not isinstance(results, list)
+        or not _is_nonnegative_int(total_matches)
+        or not _is_nonnegative_int(documents_with_matches)
+        or documents_with_matches != len(results)
+    ):
+        raise _tool_error("grep_documents", "returned invalid match metadata")
+
+    seen_urns: set[str] = set()
+    observed_total = 0
+    for result in results:
+        if not isinstance(result, Mapping):
+            raise _tool_error("grep_documents", "returned invalid match metadata")
+        urn = result.get("urn")
+        title = result.get("title")
+        matches = result.get("matches")
+        document_total = result.get("total_matches")
+        if (
+            not _is_document_urn(urn)
+            or urn in seen_urns
+            or not isinstance(title, str)
+            or not title.strip()
+            or not isinstance(matches, list)
+            or not matches
+            or not _is_nonnegative_int(document_total)
+            or document_total < len(matches)
+        ):
+            raise _tool_error("grep_documents", "returned invalid match metadata")
+        content_length = result.get("content_length")
+        if "content_length" in result and not _is_nonnegative_int(content_length):
+            raise _tool_error("grep_documents", "returned invalid match metadata")
+        for match in matches:
+            if not isinstance(match, Mapping):
+                raise _tool_error(
+                    "grep_documents", "returned invalid match metadata"
+                )
+            excerpt = match.get("excerpt")
+            position = match.get("position")
+            if (
+                not isinstance(excerpt, str)
+                or not _is_nonnegative_int(position)
+                or position < minimum_position
+            ):
+                raise _tool_error(
+                    "grep_documents", "returned invalid match metadata"
+                )
+        seen_urns.add(urn)
+        observed_total += document_total
+
+    if total_matches != observed_total:
+        raise _tool_error("grep_documents", "returned invalid match metadata")
+    return payload
+
+
 class FixtureDataHubContext:
     """Deterministic offline context with in-memory document recording."""
 
@@ -375,6 +660,7 @@ class FixtureDataHubContext:
         self.fixture_path = Path(fixture_path)
         self._fixture = json.loads(self.fixture_path.read_text(encoding="utf-8"))
         self.saved_documents: list[dict[str, Any]] = []
+        self._saved_document_records: list[dict[str, Any]] = []
 
     def _dataset(self) -> Mapping[str, Any] | None:
         data = self._fixture.get("data")
@@ -427,17 +713,155 @@ class FixtureDataHubContext:
     ) -> list[dict[str, Any]]:
         """Return fixture entity details in the caller's requested order."""
 
-        entities_by_urn = {
+        entities_by_urn: dict[str, dict[str, Any]] = {
             result["entity"]["urn"]: result["entity"]
             for result in self._search_results()
             if isinstance(result.get("entity"), Mapping)
             and isinstance(result["entity"].get("urn"), str)
         }
-        return [
-            deepcopy(entities_by_urn[urn])
-            for urn in urns
-            if urn in entities_by_urn
+        dataset = self._dataset()
+        if dataset is not None and isinstance(dataset.get("urn"), str):
+            entities_by_urn[dataset["urn"]] = {
+                "urn": dataset["urn"],
+                "type": "DATASET",
+            }
+        for document in self._saved_document_records:
+            entities_by_urn[document["urn"]] = {
+                "urn": document["urn"],
+                "type": "DOCUMENT",
+            }
+
+        entities: list[dict[str, Any]] = []
+        for urn in urns:
+            if urn not in entities_by_urn:
+                continue
+            entity = deepcopy(entities_by_urn[urn])
+            related_documents = [
+                {
+                    "urn": document["urn"],
+                    "type": "DOCUMENT",
+                    "info": {"title": document["title"]},
+                }
+                for document in self._saved_document_records
+                if urn in document["related_assets"]
+            ]
+            if related_documents:
+                entity["relatedDocuments"] = {
+                    "start": 0,
+                    "count": len(related_documents),
+                    "total": len(related_documents),
+                    "documents": related_documents,
+                }
+            entities.append(entity)
+        return entities
+
+    async def search_documents(
+        self,
+        *,
+        query: str,
+        num_results: int = 10,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """Search fixture documents by title using DataHub's result shape."""
+
+        _validate_document_search_arguments(query, num_results, offset)
+        normalized_query = query.casefold()
+        matches = [
+            document
+            for document in self._saved_document_records
+            if query == "*" or normalized_query in document["title"].casefold()
         ]
+        page = matches[offset : offset + num_results]
+        payload = {
+            "start": offset,
+            "count": num_results,
+            "total": len(matches),
+            "searchResults": [
+                {
+                    "entity": {
+                        "urn": document["urn"],
+                        "subType": document["document_type"],
+                        "info": {"title": document["title"]},
+                    }
+                }
+                for document in page
+            ],
+        }
+        return _validated_document_search_payload(
+            payload,
+            expected_offset=offset,
+            requested_count=num_results,
+        )
+
+    async def grep_documents(
+        self,
+        *,
+        urns: Sequence[str],
+        pattern: str,
+        context_chars: int = 200,
+        max_matches_per_doc: int = 5,
+        start_offset: int = 0,
+    ) -> dict[str, Any]:
+        """Search fixture document content using DataHub's result shape."""
+
+        document_urns = _validate_grep_arguments(
+            urns,
+            pattern,
+            context_chars,
+            max_matches_per_doc,
+            start_offset,
+        )
+        try:
+            expression = re.compile(pattern)
+        except re.error:
+            raise _tool_error("grep_documents", "received an invalid pattern") from None
+
+        results: list[dict[str, Any]] = []
+        total_matches = 0
+        for document in self._saved_document_records:
+            if document["urn"] not in document_urns:
+                continue
+            content = document["content"]
+            if start_offset >= len(content):
+                continue
+            searchable = content[start_offset:]
+            found = list(expression.finditer(searchable))
+            if not found:
+                continue
+            excerpts: list[dict[str, Any]] = []
+            for match in found[:max_matches_per_doc]:
+                excerpt_start = max(0, match.start() - context_chars)
+                excerpt_end = min(len(searchable), match.end() + context_chars)
+                excerpt = searchable[excerpt_start:excerpt_end]
+                if excerpt_start > 0:
+                    excerpt = "..." + excerpt
+                if excerpt_end < len(searchable):
+                    excerpt += "..."
+                excerpts.append(
+                    {
+                        "excerpt": excerpt,
+                        "position": match.start() + start_offset,
+                    }
+                )
+            entry: dict[str, Any] = {
+                "urn": document["urn"],
+                "title": document["title"],
+                "matches": excerpts,
+                "total_matches": len(found),
+            }
+            if start_offset > 0:
+                entry["content_length"] = len(content)
+            results.append(entry)
+            total_matches += len(found)
+        payload = {
+            "results": results,
+            "total_matches": total_matches,
+            "documents_with_matches": len(results),
+        }
+        return _validated_grep_documents_payload(
+            payload,
+            minimum_position=start_offset,
+        )
 
     async def save_document(
         self,
@@ -460,6 +884,15 @@ class FixtureDataHubContext:
                 "related_assets": list(related_assets),
             }
         )
+        self._saved_document_records.append(
+            {
+                "document_type": document_type,
+                "title": title,
+                "content": content,
+                "urn": resolved_urn,
+                "related_assets": list(related_assets),
+            }
+        )
         return {
             "success": True,
             "urn": resolved_urn,
@@ -474,6 +907,54 @@ def _new_httpx_client(**kwargs: Any) -> httpx.AsyncClient:
     return httpx.AsyncClient(**kwargs)
 
 
+def _validated_credential_url(value: object, *, variable_name: str) -> str:
+    """Validate an HTTP endpoint before attaching bearer credentials."""
+
+    error = DataHubConfigurationError(
+        f"{variable_name} must be HTTPS, or HTTP on a loopback host"
+    )
+    if not isinstance(value, str) or not value or any(
+        character.isspace()
+        or unicodedata.category(character).startswith("C")
+        for character in value
+    ):
+        raise error
+
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except (TypeError, ValueError):
+        raise error from None
+
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or "#" in value
+    ):
+        raise error
+
+    # ``urlsplit`` accepts an explicitly empty port, but it is not a valid
+    # endpoint authority for this credential-bearing transport.
+    authority = parsed.netloc.rsplit("@", 1)[-1]
+    if authority.endswith(":") or port is not None and port <= 0:
+        raise error
+
+    if parsed.scheme == "http":
+        hostname = parsed.hostname.casefold()
+        if hostname != "localhost":
+            try:
+                is_loopback = ipaddress.ip_address(hostname).is_loopback
+            except ValueError:
+                is_loopback = False
+            if not is_loopback:
+                raise error
+
+    return value
+
+
 def build_mcp_client_factory(
     environ: Mapping[str, str] | None = None,
 ) -> ClientFactory:
@@ -482,6 +963,10 @@ def build_mcp_client_factory(
     source = dict(os.environ if environ is None else environ)
     mcp_url = source.get("DATAHUB_MCP_URL")
     if mcp_url:
+        mcp_url = _validated_credential_url(
+            mcp_url,
+            variable_name="DATAHUB_MCP_URL",
+        )
         headers: dict[str, str] = {}
         mcp_token = source.get("DATAHUB_MCP_TOKEN")
         if mcp_token:
@@ -506,6 +991,10 @@ def build_mcp_client_factory(
         raise DataHubConfigurationError(
             "DATAHUB_GMS_URL must be explicitly set for local stdio MCP mode"
         )
+    gms_url = _validated_credential_url(
+        gms_url,
+        variable_name="DATAHUB_GMS_URL",
+    )
 
     child_env = {
         key: source[key]
@@ -524,6 +1013,7 @@ def build_mcp_client_factory(
             args=["-m", "mcp_server_datahub", "--transport", "stdio"],
             env=dict(child_env),
             keep_alive=False,
+            log_file=Path(os.devnull),
         )
         return Client(
             transport,

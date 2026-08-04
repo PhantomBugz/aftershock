@@ -69,9 +69,9 @@ class AftershockIncidentEnvelope(BaseModel):
 async def _default_processor_session() -> AsyncIterator[AftershockIncidentProcessor]:
     """Build and close one live or explicitly configured fixture session."""
 
-    allowed_endpoints = build_remediation_allowlist_from_env()
+    allowed_controls = build_remediation_allowlist_from_env()
     context = build_datahub_context_from_env()
-    engine = CompensatingActionEngine(allowed_endpoints=allowed_endpoints)
+    engine = CompensatingActionEngine(allowed_controls=allowed_controls)
     try:
         yield AftershockIncidentProcessor(context, engine)
     finally:

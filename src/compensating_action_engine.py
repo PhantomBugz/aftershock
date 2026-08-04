@@ -12,6 +12,7 @@ import os
 import threading
 import unicodedata
 from collections.abc import Collection, Mapping, Sequence
+from dataclasses import dataclass
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
@@ -29,6 +30,11 @@ _HTTPX_REQUEST_LOG_FILTER_LOCK = threading.Lock()
 _ALLOWLIST_ENV = "AFTERSHOCK_REMEDIATION_ALLOWLIST_JSON"
 _ALLOWLIST_ERROR = "invalid remediation endpoint allowlist configuration"
 _MAX_EXTERNAL_RECEIPT_ID_LENGTH = 256
+_MAX_RECEIPT_RESPONSE_BYTES = 64 * 1024
+_MAX_LOG_VALUE_LENGTH = 256
+_CONTROL_KEYS = frozenset(
+    {"target_urn", "entity_type", "business_action", "endpoint"}
+)
 
 # Compensating-control response contract v1. A terminal result is proven only
 # by a JSON object with these three top-level fields:
@@ -43,6 +49,34 @@ _V1_NONTERMINAL_STATUSES = frozenset({"accepted", "pending"})
 
 class RemediationConfigurationError(RuntimeError):
     """The operator-provided outbound endpoint policy is unusable."""
+
+
+@dataclass(frozen=True, slots=True)
+class RemediationGrant:
+    """One immutable, exact authorization for one compensating control."""
+
+    target_urn: str
+    entity_type: str
+    business_action: str
+    endpoint: str
+
+    def __post_init__(self) -> None:
+        if (
+            not _is_exact_control_value(self.target_urn)
+            or not _is_exact_control_value(self.entity_type)
+            or not _is_exact_control_value(self.business_action)
+            or not _is_authorizable_endpoint(self.endpoint)
+        ):
+            raise RemediationConfigurationError(_ALLOWLIST_ERROR)
+
+
+def _strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON object key")
+        result[key] = value
+    return result
 
 
 class _HttpxRequestURLFilter(logging.Filter):
@@ -76,36 +110,44 @@ def _install_httpx_request_log_filter() -> None:
             httpx_logger.addFilter(_HTTPX_REQUEST_URL_FILTER)
 
 
-def parse_remediation_allowlist_json(raw: str | None) -> frozenset[str]:
-    """Parse a nonempty JSON array of exact, independently safe URLs.
-
-    The returned strings are deliberately not broadened or prefix-matched.
-    Path and query are part of the authorization decision.
-    """
+def parse_remediation_allowlist_json(
+    raw: str | None,
+) -> frozenset[RemediationGrant]:
+    """Parse exact target/action/endpoint grants from operator JSON."""
 
     if not isinstance(raw, str) or not raw.strip():
         raise RemediationConfigurationError(_ALLOWLIST_ERROR)
     try:
-        decoded = json.loads(raw)
+        decoded = json.loads(raw, object_pairs_hook=_strict_json_object)
     except (TypeError, ValueError):
         raise RemediationConfigurationError(_ALLOWLIST_ERROR) from None
     if not isinstance(decoded, list) or not decoded:
         raise RemediationConfigurationError(_ALLOWLIST_ERROR)
 
-    endpoints: set[str] = set()
-    for endpoint in decoded:
-        if not isinstance(endpoint, str) or not _is_authorizable_endpoint(endpoint):
+    controls: set[RemediationGrant] = set()
+    for item in decoded:
+        if not isinstance(item, dict) or set(item) != _CONTROL_KEYS:
             raise RemediationConfigurationError(_ALLOWLIST_ERROR)
-        endpoints.add(endpoint)
-    if not endpoints:
+        try:
+            controls.add(
+                RemediationGrant(
+                    target_urn=item["target_urn"],
+                    entity_type=item["entity_type"],
+                    business_action=item["business_action"],
+                    endpoint=item["endpoint"],
+                )
+            )
+        except (KeyError, TypeError, RemediationConfigurationError):
+            raise RemediationConfigurationError(_ALLOWLIST_ERROR) from None
+    if not controls:
         raise RemediationConfigurationError(_ALLOWLIST_ERROR)
-    return frozenset(endpoints)
+    return frozenset(controls)
 
 
 def build_remediation_allowlist_from_env(
     environ: Mapping[str, str] | None = None,
-) -> frozenset[str]:
-    """Build the exact endpoint policy from operator environment config."""
+) -> frozenset[RemediationGrant]:
+    """Build exact remediation grants from operator environment config."""
 
     source = os.environ if environ is None else environ
     return parse_remediation_allowlist_json(source.get(_ALLOWLIST_ENV))
@@ -118,7 +160,7 @@ class CompensatingActionEngine:
         self,
         http_client: httpx.AsyncClient | None = None,
         *,
-        allowed_endpoints: Collection[str] | None = None,
+        allowed_controls: Collection[RemediationGrant] | None = None,
         max_concurrency: int = 8,
         workflow_timeout_seconds: float = 30.0,
     ) -> None:
@@ -136,21 +178,20 @@ class CompensatingActionEngine:
             or workflow_timeout_seconds <= 0
         ):
             raise ValueError("workflow_timeout_seconds must be finite and positive")
-        if isinstance(allowed_endpoints, (str, bytes)):
+        if isinstance(allowed_controls, (str, bytes, Mapping)):
             raise RemediationConfigurationError(_ALLOWLIST_ERROR)
 
-        configured_endpoints = tuple(allowed_endpoints or ())
+        configured_controls = tuple(allowed_controls or ())
         if any(
-            not isinstance(endpoint, str)
-            or not _is_authorizable_endpoint(endpoint)
-            for endpoint in configured_endpoints
+            type(control) is not RemediationGrant
+            for control in configured_controls
         ):
             raise RemediationConfigurationError(_ALLOWLIST_ERROR)
-        governed_endpoints = frozenset(configured_endpoints)
+        governed_controls = frozenset(configured_controls)
 
         self.http_client = http_client or httpx.AsyncClient(timeout=10.0)
         self._owns_client = http_client is None
-        self.allowed_endpoints = governed_endpoints
+        self.allowed_controls = governed_controls
         self.max_concurrency = max_concurrency
         self.workflow_timeout_seconds = float(workflow_timeout_seconds)
 
@@ -165,11 +206,12 @@ class CompensatingActionEngine:
     ) -> RemediationReceipt:
         """Attempt one governed control and return secret-safe evidence."""
 
+        log_target = _safe_log_value(target.urn)
         missing = _missing_playbook_error(target)
         if missing is not None:
             logger.warning(
                 "Skipping remediation control for target %s: incomplete playbook",
-                target.urn,
+                log_target,
             )
             return _receipt(
                 target,
@@ -183,7 +225,7 @@ class CompensatingActionEngine:
         if not _is_authorizable_endpoint(raw_endpoint):
             logger.error(
                 "Remediation control for target %s has an invalid endpoint",
-                target.urn,
+                log_target,
             )
             return _receipt(
                 target,
@@ -194,17 +236,26 @@ class CompensatingActionEngine:
             )
 
         endpoint = _sanitize_endpoint(raw_endpoint)
-        if raw_endpoint not in self.allowed_endpoints:
+        try:
+            selected_control = RemediationGrant(
+                target_urn=target.urn,
+                entity_type=target.entity_type,
+                business_action=target.business_action,
+                endpoint=raw_endpoint,
+            )
+        except RemediationConfigurationError:
+            selected_control = None
+        if selected_control not in self.allowed_controls:
             logger.warning(
-                "Skipping remediation control for target %s: endpoint denied by policy",
-                target.urn,
+                "Skipping remediation control for target %s: control denied by policy",
+                log_target,
             )
             return _receipt(
                 target,
                 incident_id,
                 endpoint=endpoint,
                 status="skipped",
-                error="remediation endpoint is not allowlisted",
+                error="remediation control is not authorized",
             )
 
         payload = {
@@ -222,13 +273,14 @@ class CompensatingActionEngine:
                 headers={
                     "Idempotency-Key": _idempotency_key(
                         incident_id, target.urn, target.business_action
-                    )
+                    ),
+                    "Accept-Encoding": "identity",
                 },
             )
         except Exception:
             logger.error(
                 "Remediation request preparation failed for target %s",
-                target.urn,
+                log_target,
             )
             return _receipt(
                 target,
@@ -245,11 +297,12 @@ class CompensatingActionEngine:
             response = await self.http_client.send(
                 request,
                 follow_redirects=False,
+                stream=True,
             )
         except httpx.RequestError:
             logger.error(
                 "Remediation outcome is unknown after dispatch for target %s",
-                target.urn,
+                log_target,
             )
             return _receipt(
                 target,
@@ -263,7 +316,7 @@ class CompensatingActionEngine:
             # Details may contain URLs, bodies, or credentials, so omit them.
             logger.error(
                 "Unexpected remediation outcome after dispatch for target %s",
-                target.urn,
+                log_target,
             )
             return _receipt(
                 target,
@@ -273,17 +326,20 @@ class CompensatingActionEngine:
                 error="remediation outcome unknown after dispatch",
             )
 
-        return _receipt_from_response(target, incident_id, endpoint, response)
+        return await _receipt_from_response(
+            target, incident_id, endpoint, response
+        )
 
     async def process_blast_radius(
         self, targets: Sequence[ActionableTarget], incident_id: str
     ) -> list[RemediationReceipt]:
         """Execute targets with bounded workers, preserving input ordering."""
 
+        log_incident = _safe_log_value(incident_id)
         logger.info(
             "Processing %d downstream remediation controls for incident %s",
             len(targets),
-            incident_id,
+            log_incident,
         )
         if not targets:
             return []
@@ -347,7 +403,7 @@ class CompensatingActionEngine:
 
         logger.info(
             "Remediation controls settled for incident %s: %s",
-            incident_id,
+            log_incident,
             ", ".join(
                 f"{status}={sum(receipt.status == status for receipt in settled)}"
                 for status in (
@@ -362,18 +418,62 @@ class CompensatingActionEngine:
         return settled
 
 
-def _receipt_from_response(
+async def _receipt_from_response(
     target: ActionableTarget,
     incident_id: str,
     endpoint: str,
     response: httpx.Response,
 ) -> RemediationReceipt:
     status_code = response.status_code
+    log_target = _safe_log_value(target.urn)
+    body, read_error = await _read_bounded_response(response)
     ambiguous_http_status = status_code == 408 or 500 <= status_code < 600
-    if not 200 <= status_code < 300 and not ambiguous_http_status:
+    clear_http_failure = not 200 <= status_code < 300 and not ambiguous_http_status
+
+    if read_error is not None:
+        if clear_http_failure:
+            logger.error(
+                "Remediation control failed for target %s with HTTP %d",
+                log_target,
+                status_code,
+            )
+            return _receipt(
+                target,
+                incident_id,
+                endpoint=endpoint,
+                status="failed",
+                http_status=status_code,
+                error=f"remediation endpoint returned HTTP {status_code}",
+            )
+        logger.warning(
+            "Remediation response could not prove an outcome for target %s",
+            log_target,
+        )
+        return _receipt(
+            target,
+            incident_id,
+            endpoint=endpoint,
+            status="outcome_unknown",
+            http_status=status_code,
+            error=read_error,
+        )
+
+    payload = _response_json_object(body)
+    contract = _v1_contract(payload)
+    if clear_http_failure:
+        if contract is not None and contract[0] == "failed":
+            return _receipt(
+                target,
+                incident_id,
+                endpoint=endpoint,
+                status="failed",
+                http_status=status_code,
+                external_receipt_id=contract[1],
+                error="remediation endpoint reported terminal failure",
+            )
         logger.error(
             "Remediation control failed for target %s with HTTP %d",
-            target.urn,
+            log_target,
             status_code,
         )
         return _receipt(
@@ -385,14 +485,12 @@ def _receipt_from_response(
             error=f"remediation endpoint returned HTTP {status_code}",
         )
 
-    payload = _response_json_object(response)
-    contract = _v1_contract(payload)
     if ambiguous_http_status and (
         contract is None or contract[0] not in _V1_TERMINAL_STATUSES
     ):
         logger.warning(
             "Remediation outcome is unknown for target %s after HTTP %d",
-            target.urn,
+            log_target,
             status_code,
         )
         return _receipt(
@@ -404,29 +502,12 @@ def _receipt_from_response(
             error="remediation outcome unknown after dispatch",
         )
 
-    if status_code == 202:
-        accepted_receipt_id = (
-            contract[1]
-            if contract is not None
-            else _valid_receipt_id(payload.get("receipt_id"))
-            if payload is not None
-            else None
-        )
-        return _receipt(
-            target,
-            incident_id,
-            endpoint=endpoint,
-            status="accepted",
-            http_status=status_code,
-            external_receipt_id=accepted_receipt_id,
-        )
-
     if contract is not None:
         contract_status, receipt_id = contract
         if contract_status == "succeeded":
             logger.info(
                 "Remediation control returned terminal success for target %s",
-                target.urn,
+                log_target,
             )
             return _receipt(
                 target,
@@ -455,14 +536,13 @@ def _receipt_from_response(
             external_receipt_id=receipt_id,
         )
 
-    if payload is not None and payload.get("accepted") is True:
+    if status_code == 202:
         return _receipt(
             target,
             incident_id,
             endpoint=endpoint,
             status="accepted",
             http_status=status_code,
-            external_receipt_id=_valid_receipt_id(payload.get("receipt_id")),
         )
 
     return _receipt(
@@ -475,9 +555,92 @@ def _receipt_from_response(
     )
 
 
-def _response_json_object(response: httpx.Response) -> dict[str, object] | None:
+async def _read_bounded_response(
+    response: httpx.Response,
+) -> tuple[bytes | None, str | None]:
+    """Read at most 64 KiB of raw identity-encoded receipt evidence."""
+
+    body = bytearray()
+    read_error: str | None = None
     try:
-        payload = response.json()
+        content_encoding = response.headers.get("Content-Encoding", "identity")
+        if content_encoding.strip().casefold() not in {"", "identity"}:
+            read_error = "remediation response used unsupported content encoding"
+        elif response.is_stream_consumed:
+            loaded_body = response.content
+            if len(loaded_body) > _MAX_RECEIPT_RESPONSE_BYTES:
+                read_error = (
+                    "remediation response exceeded "
+                    f"{_MAX_RECEIPT_RESPONSE_BYTES} bytes"
+                )
+            else:
+                body.extend(loaded_body)
+        elif not isinstance(response.stream, httpx.AsyncByteStream):
+            read_error = "remediation response could not be read"
+        else:
+            # Iterate the raw stream directly so HTTPX cannot mark the response
+            # closed before its own close await completes. Closure is handled
+            # exactly once below and is protected from caller cancellation.
+            response.is_stream_consumed = True
+            async for chunk in response.stream:
+                if len(body) + len(chunk) > _MAX_RECEIPT_RESPONSE_BYTES:
+                    read_error = (
+                        "remediation response exceeded "
+                        f"{_MAX_RECEIPT_RESPONSE_BYTES} bytes"
+                    )
+                    break
+                body.extend(chunk)
+    except Exception:
+        read_error = "remediation response could not be read"
+    finally:
+        closed = await _close_response_before_cancellation(response)
+        if not closed and read_error is None:
+            read_error = "remediation response could not be closed"
+
+    if read_error is not None:
+        return None, read_error
+    return bytes(body), None
+
+
+async def _close_response_before_cancellation(
+    response: httpx.Response,
+) -> bool:
+    """Finish one response close before propagating caller cancellation."""
+
+    close_task = asyncio.create_task(response.aclose())
+    cancellation: asyncio.CancelledError | None = None
+    close_failed = False
+    while not close_task.done():
+        try:
+            await asyncio.shield(close_task)
+        except asyncio.CancelledError as observed:
+            if cancellation is None:
+                cancellation = observed
+        except Exception:
+            close_failed = True
+            break
+
+    if close_task.done():
+        try:
+            close_task.result()
+        except asyncio.CancelledError as observed:
+            if cancellation is None:
+                cancellation = observed
+        except Exception:
+            close_failed = True
+
+    if cancellation is not None:
+        raise cancellation
+    return not close_failed
+
+
+def _response_json_object(body: bytes | None) -> dict[str, object] | None:
+    if body is None:
+        return None
+    try:
+        payload = json.loads(
+            body.decode("utf-8"), object_pairs_hook=_strict_json_object
+        )
     except Exception:
         # Decoder details and body excerpts are not receipt evidence.
         return None
@@ -519,6 +682,41 @@ def _missing_playbook_error(target: ActionableTarget) -> str | None:
     if missing_webhook:
         return "missing remediation webhook"
     return None
+
+
+def _safe_log_value(value: object) -> str:
+    """Render one bounded log field without line or terminal controls."""
+
+    try:
+        text = str(value)
+    except Exception:
+        return "<unprintable>"
+    safe = "".join(
+        " "
+        if character.isspace()
+        or unicodedata.category(character).startswith("C")
+        else character
+        for character in text
+    )
+    collapsed = " ".join(safe.split()) or "<empty>"
+    if len(collapsed) > _MAX_LOG_VALUE_LENGTH:
+        return f"{collapsed[: _MAX_LOG_VALUE_LENGTH - 3]}..."
+    return collapsed
+
+
+def _is_exact_control_value(value: object) -> bool:
+    """Reject values whose authorization meaning depends on normalization."""
+
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and value == value.strip()
+        and not any(
+            character.isspace()
+            or unicodedata.category(character).startswith("C")
+            for character in value
+        )
+    )
 
 
 def _is_authorizable_endpoint(raw_url: object) -> bool:

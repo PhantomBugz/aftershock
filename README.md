@@ -1,20 +1,26 @@
 # Aftershock
 
 Aftershock is a DataHub-backed incident-response agent for the **Agents That Do
-Real Work** challenge. It is a deterministic, policy-driven agent loop:
+Real Work** challenge. It is a deterministic, auditable, policy-driven agent
+loop:
 
 ```text
 observe DataHub context -> decide from governed metadata and policy
-                        -> act through an allowlisted control
+                        -> act through an exact remediation grant
                         -> persist receipts back to DataHub
 ```
 
-Aftershock does not claim generative or LLM reasoning. Its agency comes from
-closing this governed observe/decide/act/persist loop after an authenticated
-incident trigger.
+Its agency comes from closing this governed observe/decide/act/persist loop.
+The listener/API path begins after an authenticated incident trigger; the live
+judge command invokes the same processor directly for the fixed seeded
+scenario. Every demonstrated decision is reproducible from DataHub metadata
+and operator policy.
 
 We use **Action Debt** as project terminology for operational follow-up created
 when an automated system acts on data that is later found to be unreliable.
+In the live proof, bad pricing has already issued `PO-AFTERSHOCK-001`;
+Aftershock finds the exposed job in DataHub, cancels that order, prevents the
+next issuance, and writes the PO-bound receipt back.
 
 ## What it does
 
@@ -25,7 +31,8 @@ For a critical Aftershock-normalized incident envelope, the workflow:
 3. fetches entity metadata with `get_entities`;
 4. reads the exact structured-property qualified names
    `aftershock.businessAction` and `aftershock.remediationWebhook`;
-5. checks every endpoint against an operator-controlled exact URL allowlist;
+5. checks the target URN, entity type, business action, and endpoint against an
+   operator-controlled exact remediation grant;
 6. invokes bounded, asynchronous compensating controls and records factual
    receipts; and
 7. calls `save_document` through MCP to persist the incident summary and
@@ -56,7 +63,7 @@ DataHub incidentInfo MetadataChangeLogEvent
         |                  |                 |
         +---- governed target policy ----+  |
                                         |  |
-                            allowlisted controls
+                           exact remediation grants
                                         |
                          receipts + DataHub incident record
 ```
@@ -108,21 +115,65 @@ conservatively `outcome_unknown`; work not yet dispatched is `skipped`.
 ## Governed outbound controls
 
 Critical listener sessions require `AFTERSHOCK_REMEDIATION_ALLOWLIST_JSON`, a
-nonempty JSON array of exact URLs:
+nonempty JSON array of exact, four-field grants. An endpoint alone cannot
+authorize a different asset or business action:
 
 ```powershell
-$env:AFTERSHOCK_REMEDIATION_ALLOWLIST_JSON = '["http://127.0.0.1:8765/remediate/cancel_po"]'
+$env:AFTERSHOCK_REMEDIATION_ALLOWLIST_JSON = '[{"target_urn":"urn:li:dataJob:(urn:li:dataFlow:(airflow,aftershock_demo,DEV),purchase_order_generator)","entity_type":"DATA_JOB","business_action":"ISSUE_PO","endpoint":"http://127.0.0.1:8765/remediate/cancel_po"}]'
 ```
 
-Authorization is exact: scheme, host, port, path, and query must match the
-metadata value. User information and fragments are rejected. Plain HTTP is
-allowed only for loopback hosts; nonloopback endpoints require HTTPS.
-Redirects are disabled. Query values may participate in authorization but are
-removed from logs and persisted receipt endpoints.
+Authorization is exact across `target_urn`, `entity_type`, `business_action`,
+and `endpoint`. The endpoint's scheme, host, port, path, and query must also
+match. User information and fragments are rejected. Plain HTTP is allowed only
+for loopback hosts; nonloopback endpoints require HTTPS. Redirects are
+disabled. Query values may participate in authorization but are removed from
+logs and persisted receipt endpoints.
 
 Never put credentials in a structured property or URL. DataHub property-write
 RBAC, document-mutation permissions, receiver authentication, and network
 egress policy remain operator responsibilities.
+
+## Run the live judge demonstration
+
+The primary submission path uses a real local DataHub OSS deployment, the
+official DataHub MCP server, a loopback-only stateful receiver, and independent
+MCP read-back. First follow the [live setup guide][live-setup] to start and seed
+DataHub. Then start the built-in receiver in one PowerShell window:
+
+```powershell
+python src\demo_remediation_receiver.py
+```
+
+In a second window, select the live MCP context and run the proof gate:
+
+```powershell
+$env:AFTERSHOCK_DATAHUB_MODE = "mcp"
+$env:DATAHUB_GMS_URL = "http://127.0.0.1:8080"
+Remove-Item Env:DATAHUB_GMS_TOKEN -ErrorAction SilentlyContinue
+Remove-Item Env:DATAHUB_MCP_URL -ErrorAction SilentlyContinue
+Remove-Item Env:DATAHUB_MCP_TOKEN -ErrorAction SilentlyContinue
+python src\live_demo.py
+```
+
+`live_demo.py` refuses fixture mode. It resets the receiver and displays the
+seeded order `PO-AFTERSHOCK-001` as `issued`. It then executes the
+OBSERVE/DECIDE/ACT/PERSIST loop, requires a PO-bound terminal v1 success
+receipt, confirms the order is `canceled` and further issuance is disabled,
+and requires the DataHub write-back to succeed. It then proves persistence
+through three independent MCP reads:
+
+1. `search_documents` finds the exact generated document URN and title;
+2. `grep_documents` finds the incident ID and external receipt ID in content;
+3. `get_entities` finds the saved document in both the dataset and DataJob
+   `relatedDocuments` backlinks.
+
+On August 4, 2026, this path passed against local DataHub OSS Quickstart v1.6.0:
+the seeded order changed from `issued` to `canceled` exactly once, the same
+PO-bound receipt was persisted to DataHub, and all read-back gates passed. The
+credential-free evidence is captured in
+[`examples/live_demo_proof.txt`](examples/live_demo_proof.txt).
+
+![Local DataHub OSS UI showing the saved Aftershock incident document in MCP context with its PO-bound terminal control receipt](docs/assets/datahub-live-incident.png)
 
 ## Run the deterministic demonstration
 
@@ -139,7 +190,7 @@ python src\demo_dashboard.py
 ```
 
 The dashboard is unmistakably labeled **OFFLINE FIXTURE MODE**. It uses local,
-deterministic lineage, an exact in-memory allowlist, `httpx.MockTransport`
+deterministic lineage, exact in-memory remediation grants, `httpx.MockTransport`
 responses containing valid v1 terminal receipts, and an in-memory write-back
 recorder. It does not represent a live DataHub run.
 
@@ -156,7 +207,7 @@ receipts. Use the dashboard for a deterministic presentation.
 ```powershell
 $env:AFTERSHOCK_DATAHUB_MODE = "fixture"
 $env:AFTERSHOCK_WEBHOOK_TOKEN = "replace-with-a-long-random-secret"
-$env:AFTERSHOCK_REMEDIATION_ALLOWLIST_JSON = '["https://api.internal.example/remediate/cancel_po","https://api.internal.example/remediate/revert_pricing"]'
+$env:AFTERSHOCK_REMEDIATION_ALLOWLIST_JSON = '[{"target_urn":"urn:li:dataJob:(urn:li:dataFlow:(airflow,aftershock_demo,PROD),purchase_order_generator)","entity_type":"DATA_JOB","business_action":"ISSUE_PO","endpoint":"https://api.internal.example/remediate/cancel_po"},{"target_urn":"urn:li:mlModel:(urn:li:dataPlatform:sagemaker,dynamic_pricing_model,PROD)","entity_type":"ML_MODEL","business_action":"ADJUST_PRICE","endpoint":"https://api.internal.example/remediate/revert_pricing"}]'
 python -m uvicorn lineage_listener:app --app-dir src --host 127.0.0.1 --port 8000
 ```
 
@@ -180,9 +231,9 @@ Invoke-RestMethod `
 
 Critical envelopes require `Authorization: Bearer <AFTERSHOCK_WEBHOOK_TOKEN>`.
 Invalid input returns 422; missing or invalid authorization returns 401;
-missing authentication/allowlist configuration or unavailable DataHub
+missing authentication/remediation configuration or unavailable DataHub
 processing returns a fixed, secret-safe 503. Noncritical envelopes return
-`ignored` before opening a DataHub context or constructing the allowlist.
+`ignored` before opening a DataHub context or constructing remediation grants.
 
 Fixture metadata is explicitly synthetic and uses `PROD` URNs. The separate
 live bootstrap uses collision-checked, namespaced `DEV` assets. Follow the
@@ -197,6 +248,9 @@ handling, receiver requirements, and exact commands.
 - `src/incident_processor.py` — read, act, and `save_document` orchestration
 - `src/lineage_listener.py` — authenticated normalized-envelope API
 - `src/demo_dashboard.py` — receipt-driven offline presentation
+- `src/demo_contract.py` — exact seeded live-demo identities and endpoint
+- `src/demo_remediation_receiver.py` — loopback-only observable demo control
+- `src/live_demo.py` — live MCP workflow and three-read persistence proof
 - `config/` and `scripts/` — safe live metadata bootstrap
 - `tests/` — unit, MCP protocol, API, dashboard, and opt-in live tests
 - `examples/` — captured outputs labeled by execution mode
@@ -216,10 +270,15 @@ controls. It is a project proposal, not an upstream contribution.
 ## Reproducibility and live-proof status
 
 The MCP server, FastMCP, and DataHub SDK integration dependencies are pinned.
-Offline tests and demo inputs are deterministic. Live persistence was not run
-in the development environment because no running DataHub deployment or live
-configuration was available. The opt-in live test in the setup guide is the
-proof gate; a skipped test is not a successful live result.
+Offline tests and demo inputs are deterministic. On August 4, 2026, the offline
+suite passed `309` tests with the one opt-in live test skipped as expected. The
+same live test then ran explicitly against local DataHub OSS Quickstart v1.6.0
+and passed (`1 passed in 27.59s`). The final live demonstration also proved the
+purchase-order transition from `issued` to `canceled`, canonical PO-bound
+receipt, MCP `save_document`, searchable content, and both related-asset
+backlinks. A future skipped live test still must not be presented as a new
+successful live result; use the dated
+[proof transcript](examples/live_demo_proof.txt) as the captured evidence.
 
 Useful DataHub references:
 
@@ -236,11 +295,13 @@ direction and review.
 
 ## License and submission status
 
-Licensed under the [Apache License 2.0](LICENSE). Merging and pushing the final
-branch, making the repository public, verifying license detection while signed
-out, publishing the project/video URLs, and completing the Devpost form are
-human submission steps. They are not represented as complete here; use the
-[submission checklist](docs/submission-checklist.md).
+Licensed under the [Apache License 2.0](LICENSE). The
+[public repository](https://github.com/PhantomBugz/aftershock) and GitHub's
+Apache-2.0 license detection were verified on August 4, 2026. The public default
+branch still needs the final reviewed code pushed to it. Publishing the final
+project and video URLs, completing the Devpost form, and checking every
+judge-facing resource while signed out also remain human submission steps; see
+the [submission checklist](docs/submission-checklist.md).
 
 [mcp]: https://docs.datahub.com/docs/features/feature-guides/mcp
 [properties]: https://docs.datahub.com/docs/api/tutorials/structured-properties

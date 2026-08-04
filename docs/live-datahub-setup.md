@@ -22,6 +22,10 @@ launcher options can change, so this repository does not duplicate a
 version-specific Quickstart command. Confirm that GMS is reachable and note
 its base URL and, when authentication is enabled, its token.
 
+The submission proof was run successfully on August 4, 2026 against a local
+DataHub OSS Quickstart v1.6.0 instance. This is a verified local baseline, not a
+claim that a remotely hosted DataHub instance is included with the project.
+
 The official [DataHub MCP guide](https://docs.datahub.com/docs/features/feature-guides/mcp)
 describes server requirements and mutation support. With
 `mcp-server-datahub==0.6.0`, `save_document` requires DataHub OSS 1.4.0 or
@@ -64,7 +68,8 @@ applying structured-property definitions or any asset mutation. It fails closed
 if one already exists. Only for a deliberate idempotent rerun of these exact
 demo assets, add `--allow-existing-demo-assets`. A non-loopback target is also
 refused unless its canonical origin is confirmed and
-`--allow-remote-target` is supplied explicitly.
+`--allow-remote-target` is supplied explicitly. Non-loopback targets must use
+HTTPS; the override never permits remote plain HTTP.
 
 Exact collision-override example for the local demo namespace:
 
@@ -99,12 +104,17 @@ Dataset-to-MLModel lineage. The offline fixture remains an explicitly synthetic
 `PROD` graph and includes a labeled MLModel example only to exercise mixed
 target rendering and receipt handling; its URNs are not the live seed URNs.
 
-The seeded loopback remediation URL is a placeholder. No receiver is created
-by the bootstrap, so a control receipt will not succeed unless an authorized
-receiver exists at that exact URL and it is explicitly allowlisted in
-`AFTERSHOCK_REMEDIATION_ALLOWLIST_JSON`. Do not store endpoint credentials in
-structured-property values; use the downstream service's credential-management
-mechanism.
+The seeded loopback remediation URL is implemented by the repository's
+`src/demo_remediation_receiver.py`. It is a stateful, loopback-only demonstration
+receiver. Before the control, purchase order `PO-AFTERSHOCK-001` is `issued`
+and `issue_po_enabled` is `true`; after one authorized `ISSUE_PO` compensation,
+the order is `canceled` and further issuance is disabled. It also records an
+application count, incident ID, and canonical PO-bound receipt ID so the
+business effect is independently observable. Distinct sequential or concurrent
+retry keys return that same receipt; retarget attempts fail. It is not a
+production authentication or deployment pattern. Do not store endpoint
+credentials in structured-property values; use the downstream service's
+credential-management mechanism.
 
 The receiver must return the v1 terminal success contract only after its
 business operation is terminal:
@@ -166,31 +176,94 @@ with permission to read lineage/entities and save documents. The MCP bearer
 token is distinct from a GMS token; Aftershock does not substitute one for the
 other.
 
-## 5. Start the authenticated listener
+## 5. Start the built-in loopback receiver
 
-Configure an exact outbound policy. The value must be a nonempty JSON array of
-complete URLs. The seeded live endpoint is loopback and has no receiver until
-you start one you are authorized to operate:
+Run the stateful demonstration receiver in its own PowerShell window:
+
+```powershell
+python src\demo_remediation_receiver.py
+```
+
+It binds only to `127.0.0.1:8765` and exposes the seeded remediation endpoint.
+`POST /demo/reset` restores the baseline and `GET /demo/state` exposes only the
+demonstration state. Replays of the same idempotency key and payload return the
+same receipt; a conflicting payload is rejected.
+
+## 6. Run the primary live judge path
+
+Keep the MCP configuration from step 4 and run:
+
+```powershell
+python src\live_demo.py
+```
+
+The command fails unless `AFTERSHOCK_DATAHUB_MODE=mcp`; it never substitutes
+fixture data. It constructs the one exact grant for the seeded DataJob,
+business action, entity type, and loopback endpoint. The expected visible
+sequence is:
+
+1. **RECEIVER BEFORE:** `PO-AFTERSHOCK-001=issued`,
+   `issue_po_enabled=True`, `apply_count=0`.
+2. **OBSERVE:** read downstream lineage and entity metadata through MCP.
+3. **DECIDE:** resolve the one metadata-backed remediation target.
+4. **ACT:** require the exact grant and a terminal v1 receipt.
+5. **PERSIST:** create the incident document with MCP `save_document`.
+6. **RECEIVER AFTER:** `PO-AFTERSHOCK-001=canceled`,
+   `issue_po_enabled=False`, `apply_count=1`.
+7. **LIVE DATAHUB READBACK VERIFIED:** all three independent reads pass.
+
+The three read-back checks are intentionally distinct:
+
+- `search_documents` must find the server-generated document URN and exact
+  title;
+- `grep_documents` must find the incident ID and external receipt ID in the
+  saved content; and
+- `get_entities` must show the document in both the dataset and DataJob
+  `relatedDocuments` backlinks.
+
+On August 4, 2026, this complete path succeeded against local DataHub OSS
+Quickstart v1.6.0. The order changed from `issued` to `canceled` exactly once,
+the canonical terminal receipt was
+`aftershock-demo-succeeded-PO-AFTERSHOCK-001-ea74bcc907123906e7fbaf52`, and
+DataHub returned
+`urn:li:document:shared-015c94ed-69c0-40a6-a851-ce76a4920616`. See the
+[credential-free proof transcript](../examples/live_demo_proof.txt).
+
+## 7. Run the opt-in live contract test
+
+Keep the MCP variables from step 4 and enable the test explicitly:
+
+```powershell
+$env:RUN_LIVE_DATAHUB_TESTS = "1"
+python -m pytest tests\test_live_datahub_mcp.py -q
+```
+
+The test creates a uniquely marked document and independently polls
+`search_documents`, `grep_documents`, and both related-asset projections. It
+does not invoke the remediation receiver; `live_demo.py` is the end-to-end
+business-action proof. On August 4, 2026, this test ran rather than skipping and
+passed against the local v1.6.0 instance (`1 passed in 27.59s`). A later skipped
+test is not evidence of a later successful live run.
+
+## Optional: exercise the authenticated listener
+
+The primary judge path calls the same processor directly so its proof is easy
+to see. To exercise the normalized-envelope API instead, configure an exact
+four-field grant and a webhook token:
 
 ```powershell
 $env:AFTERSHOCK_WEBHOOK_TOKEN = "replace-with-a-long-random-secret"
-$env:AFTERSHOCK_REMEDIATION_ALLOWLIST_JSON = '["http://127.0.0.1:8765/remediate/cancel_po"]'
+$env:AFTERSHOCK_REMEDIATION_ALLOWLIST_JSON = '[{"target_urn":"urn:li:dataJob:(urn:li:dataFlow:(airflow,aftershock_demo,DEV),purchase_order_generator)","entity_type":"DATA_JOB","business_action":"ISSUE_PO","endpoint":"http://127.0.0.1:8765/remediate/cancel_po"}]'
 python -m uvicorn lineage_listener:app --app-dir src --host 127.0.0.1 --port 8000
 ```
 
-The metadata URL and allowlist entry must match exactly, including scheme,
-host, port, path, and query. User information and fragments are rejected.
-Plain HTTP is accepted only for `localhost` or an IP loopback address;
-nonloopback control endpoints require HTTPS. Redirects are never followed.
-Never place a credential in the URL or DataHub metadata. Receiver
-authentication and firewall/service-mesh policy must be supplied outside that
-metadata.
+Authorization matches all four fields exactly. The endpoint's scheme, host,
+port, path, and query must also match. User information and fragments are
+rejected, plain HTTP is limited to loopback, nonloopback controls require HTTPS,
+and redirects are disabled. The operator remains responsible for DataHub RBAC,
+receiver authentication, and network egress policy.
 
-The operator remains responsible for restricting process and network egress so
-Aftershock can reach only approved receivers. The application allowlist is one
-policy layer; it is not a replacement for infrastructure egress controls.
-
-Send the current normalized envelope from a second PowerShell window:
+Send the normalized envelope from a second PowerShell window:
 
 ```powershell
 $headers = @{ Authorization = "Bearer replace-with-a-long-random-secret" }
@@ -208,45 +281,12 @@ Invoke-RestMethod `
   -Body $body
 ```
 
-This request initiates real configured control calls. The engine uses bounded
-concurrency (eight workers) and a 30-second workflow deadline by default.
-Inspect all five receipt counts (`succeeded`, `accepted`, `failed`, `skipped`,
-and `outcome_unknown`), every external receipt ID, and the returned write-back
-document URN. Overall `completed` requires every target to have terminal
-`succeeded` plus a successful DataHub write-back.
-
-The payload above is an Aftershock contract, not a DataHub event schema. The
-production ingress boundary is:
-
-```text
-incidentInfo MetadataChangeLogEvent
-  -> custom DataHub Action adapter
-  -> normalized authenticated POST
-  -> Aftershock
-```
-
-Implementing that custom adapter remains future integration work. Use the
+This payload is an Aftershock contract, not a DataHub event schema. A production
+integration would translate an `incidentInfo` MetadataChangeLogEvent through a
+custom DataHub Action into this authenticated contract. That adapter remains
+future work; see the
 [event reference](https://docs.datahub.com/docs/actions/events/metadata-change-log-event)
-and [custom Action guide](https://docs.datahub.com/docs/actions/guides/developing-an-action)
-when building it.
-
-## 6. Run the opt-in live proof gate
-
-Keep the MCP variables from step 4 and enable the test explicitly:
-
-```powershell
-$env:RUN_LIVE_DATAHUB_TESTS = "1"
-python -m pytest tests\test_live_datahub_mcp.py -q
-```
-
-Before treating this as a live success, verify that the test ran rather than
-being skipped, that all MCP calls passed, and that the incident document is
-visible in the configured DataHub instance. Without those observations, only
-the offline and in-process protocol contracts have been verified.
-
-The opt-in live test validates seeded lineage/property discovery and
-`save_document`; it does not start the placeholder receiver or prove an
-external control outcome.
+and [custom Action guide](https://docs.datahub.com/docs/actions/guides/developing-an-action).
 
 ## Fixture mode reference
 

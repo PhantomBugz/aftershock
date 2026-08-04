@@ -8,9 +8,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 import lineage_listener
-from compensating_action_engine import CompensatingActionEngine
+from compensating_action_engine import CompensatingActionEngine, RemediationGrant
 from datahub_context import FixtureDataHubContext, MCPDataHubContext
-from incident_processor import AftershockIncidentProcessor, _incident_document_urn
+from incident_processor import AftershockIncidentProcessor
 from lineage_listener import (
     app,
     get_critical_authenticator,
@@ -32,6 +32,7 @@ SAFE_AUTH_CONFIG_FAILURE = {
 }
 SAFE_UNAUTHORIZED = {"detail": "Unauthorized critical incident request"}
 TEST_WEBHOOK_TOKEN = "test-aftershock-webhook-token"
+GENERATED_DOCUMENT_URN = "urn:li:document:aftershock-generated-9942"
 CONTROL_ENDPOINTS = (
     "https://controls.example/cancel-po",
     "https://controls.example/revert-price",
@@ -40,6 +41,23 @@ FIXTURE_ENDPOINTS = (
     "https://api.internal.example/remediate/cancel_po",
     "https://api.internal.example/remediate/revert_pricing",
 )
+
+
+def _control_grants(endpoints: tuple[str, str]) -> tuple[RemediationGrant, ...]:
+    return (
+        RemediationGrant(
+            target_urn=DATA_JOB_URN,
+            entity_type="DATA_JOB",
+            business_action="ISSUE_PO",
+            endpoint=endpoints[0],
+        ),
+        RemediationGrant(
+            target_urn=MODEL_URN,
+            entity_type="ML_MODEL",
+            business_action="ADJUST_PRICE",
+            endpoint=endpoints[1],
+        ),
+    )
 
 
 def _property(qualified_name: str, value: str) -> dict[str, Any]:
@@ -97,8 +115,7 @@ def _critical_recorder() -> MCPCallRecorder:
                 "https://controls.example/revert-price",
             ),
         ],
-        save_payload={"success": True, "urn": "ignored-by-echo"},
-        echo_saved_urn=True,
+        save_payload={"success": True, "urn": GENERATED_DOCUMENT_URN},
     )
 
 
@@ -141,7 +158,7 @@ def test_critical_envelope_runs_real_mcp_processor_and_returns_report(
                 context,
                 CompensatingActionEngine(
                     http_client=http_client,
-                    allowed_endpoints=CONTROL_ENDPOINTS,
+                    allowed_controls=_control_grants(CONTROL_ENDPOINTS),
                 ),
                 clock=lambda: FIXED_NOW,
             )
@@ -159,7 +176,6 @@ def test_critical_envelope_runs_real_mcp_processor_and_returns_report(
     finally:
         app.dependency_overrides.clear()
 
-    expected_document_urn = _incident_document_urn("INC-9942", DATASET_URN)
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "completed"
@@ -184,7 +200,7 @@ def test_critical_envelope_runs_real_mcp_processor_and_returns_report(
     ]
     assert body["writeback"] == {
         "status": "succeeded",
-        "document_urn": expected_document_urn,
+        "document_urn": GENERATED_DOCUMENT_URN,
         "error": None,
     }
     assert recorder.events[:2] == ["get_lineage", "get_entities"]
@@ -199,7 +215,7 @@ def test_critical_envelope_runs_real_mcp_processor_and_returns_report(
         "save_document",
     ]
     assert recorder.calls[0][1]["upstream"] is False
-    assert recorder.calls[-1][1]["urn"] == expected_document_urn
+    assert recorder.calls[-1][1]["urn"] is None
     assert {request.url.path for request in requests} == {
         "/cancel-po",
         "/revert-price",
@@ -308,7 +324,7 @@ def test_mcp_failure_returns_fixed_secret_safe_service_error(monkeypatch) -> Non
                 context,
                 CompensatingActionEngine(
                     http_client=http_client,
-                    allowed_endpoints=CONTROL_ENDPOINTS,
+                    allowed_controls=_control_grants(CONTROL_ENDPOINTS),
                 ),
                 clock=lambda: FIXED_NOW,
             )
@@ -437,7 +453,7 @@ def test_critical_fixture_response_is_unmistakably_labeled(monkeypatch) -> None:
                 context,
                 CompensatingActionEngine(
                     http_client=http_client,
-                    allowed_endpoints=FIXTURE_ENDPOINTS,
+                    allowed_controls=_control_grants(FIXTURE_ENDPOINTS),
                 ),
                 clock=lambda: FIXED_NOW,
             )

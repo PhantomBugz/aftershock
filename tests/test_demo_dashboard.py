@@ -9,16 +9,34 @@ import httpx
 import pytest
 from rich.console import Console
 
+from compensating_action_engine import RemediationGrant
 from datahub_context import FixtureDataHubContext
 from demo_dashboard import DEMO_DATASET_URN, run_demo
 from remediation_models import IncidentReport
 
 
 FIXED_NOW = datetime(2026, 8, 4, 15, 16, 17, tzinfo=timezone.utc)
-FIXTURE_ENDPOINTS = (
-    "https://api.internal.example/remediate/cancel_po",
-    "https://api.internal.example/remediate/revert_pricing",
+FIXTURE_GRANTS = (
+    RemediationGrant(
+        target_urn=(
+            "urn:li:dataJob:(urn:li:dataFlow:(airflow,aftershock_demo,PROD),"
+            "purchase_order_generator)"
+        ),
+        entity_type="DATA_JOB",
+        business_action="ISSUE_PO",
+        endpoint="https://api.internal.example/remediate/cancel_po",
+    ),
+    RemediationGrant(
+        target_urn=(
+            "urn:li:mlModel:(urn:li:dataPlatform:sagemaker,"
+            "dynamic_pricing_model,PROD)"
+        ),
+        entity_type="ML_MODEL",
+        business_action="ADJUST_PRICE",
+        endpoint="https://api.internal.example/remediate/revert_pricing",
+    ),
 )
+DYNAMIC_TARGET_URN = "urn:li:dataJob:dynamic-test-target"
 
 
 def _console(output: StringIO) -> Console:
@@ -34,7 +52,9 @@ def _run(
     context: FixtureDataHubContext,
     handler,
     *,
-    allowed_endpoints: tuple[str, ...] = FIXTURE_ENDPOINTS,
+    allowed_controls: tuple[RemediationGrant, ...] = FIXTURE_GRANTS,
+    incident_id: str = "INC-9942",
+    dataset_urn: str = DEMO_DATASET_URN,
 ) -> tuple[IncidentReport, str]:
     output = StringIO()
 
@@ -46,7 +66,9 @@ def _run(
                 console=_console(output),
                 context=context,
                 http_client=client,
-                remediation_allowlist=allowed_endpoints,
+                remediation_grants=allowed_controls,
+                incident_id=incident_id,
+                dataset_urn=dataset_urn,
                 clock=lambda: FIXED_NOW,
                 delay=0,
             )
@@ -105,8 +127,11 @@ def test_dashboard_runs_processor_records_fixture_document_and_displays_report()
     ]
     assert report.writeback.status == "succeeded"
     assert len(context.saved_documents) == 1
-    assert context.saved_documents[0]["urn"] == report.writeback.document_urn
-    assert "OFFLINE FIXTURE MODE" in rendered
+    assert context.saved_documents[0]["urn"] is None
+    assert report.writeback.document_urn == "urn:li:document:aftershock-fixture"
+    assert "MIXED DEMO MODE" in rendered
+    assert "caller-supplied HTTP transport" in rendered
+    assert "OFFLINE FIXTURE MODE" not in rendered
     assert "Aftershock normalized incident envelope received" in rendered
     assert "get_lineage(upstream=false)" in rendered
     assert "fixture response" in rendered
@@ -114,7 +139,13 @@ def test_dashboard_runs_processor_records_fixture_document_and_displays_report()
     assert "ML_MODEL" in rendered
     assert "ISSUE_PO" in rendered
     assert "ADJUST_PRICE" in rendered
-    assert "Executing full workflow: lineage + controls + save_document" in rendered
+    assert "OBSERVE  //  reading DataHub lineage and entity metadata" in rendered
+    assert "DECIDE  //  resolved 2 metadata-backed remediation targets" in rendered
+    assert "ACT  //  evaluating 2 targets against exact remediation grants" in rendered
+    assert "PERSIST  //  saving receipt evidence to DataHub" in rendered
+    assert rendered.index("OBSERVE  //") < rendered.index("DECIDE  //")
+    assert rendered.index("DECIDE  //") < rendered.index("ACT  //")
+    assert rendered.index("ACT  //") < rendered.index("PERSIST  //")
     assert "RECORDED BLAST-RADIUS VIEW" in rendered
     assert "ACT 3  //  RECORDED CONTROL RECEIPTS" in rendered
     assert (
@@ -169,6 +200,8 @@ def test_default_fixture_transport_returns_explicit_terminal_receipts() -> None:
         "fixture-receipt-revert_pricing",
     ]
     assert "deterministic local test doubles" in output.getvalue()
+    assert "OFFLINE FIXTURE MODE" in output.getvalue()
+    assert "MIXED DEMO MODE" not in output.getvalue()
     assert "fixture-receipt-cancel_po" in output.getvalue()
 
 
@@ -177,6 +210,7 @@ def _fixture_with_target(
     *,
     action: str = "ISSUE_PO",
     webhook: str | None = "https://controls.example/cancel",
+    dataset_urn: str = DEMO_DATASET_URN,
 ) -> FixtureDataHubContext:
     properties = [
         {
@@ -202,12 +236,12 @@ def _fixture_with_target(
     payload = {
         "data": {
             "dataset": {
-                "urn": DEMO_DATASET_URN,
+                "urn": dataset_urn,
                 "downstreamLineage": {
                     "entities": [
                         {
                             "entity": {
-                                "urn": "urn:li:dataJob:dynamic-test-target",
+                                "urn": DYNAMIC_TARGET_URN,
                                 "type": "DATA_JOB",
                                 "structuredProperties": {"properties": properties},
                             }
@@ -222,26 +256,81 @@ def _fixture_with_target(
     return FixtureDataHubContext(fixture_path)
 
 
+def _dynamic_grant(action: str, endpoint: str) -> RemediationGrant:
+    return RemediationGrant(
+        target_urn=DYNAMIC_TARGET_URN,
+        entity_type="DATA_JOB",
+        business_action=action,
+        endpoint=endpoint,
+    )
+
+
+def test_dashboard_uses_the_supplied_incident_and_dataset_without_prod_copy(
+    tmp_path: Path,
+) -> None:
+    dataset_urn = (
+        "urn:li:dataset:(urn:li:dataPlatform:postgres,"
+        "aftershock_demo.inventory_pricing,DEV)"
+    )
+    endpoint = "https://controls.example/live"
+    context = _fixture_with_target(
+        tmp_path,
+        webhook=endpoint,
+        dataset_urn=dataset_urn,
+    )
+    requests: list[dict[str, Any]] = []
+
+    def terminal(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "receipt_version": 1,
+                "status": "succeeded",
+                "receipt_id": "parameterized-demo-receipt",
+            },
+        )
+
+    report, rendered = _run(
+        context,
+        terminal,
+        allowed_controls=(_dynamic_grant("ISSUE_PO", endpoint),),
+        incident_id="INC-LIVE-777",
+        dataset_urn=dataset_urn,
+    )
+
+    assert report.incident_id == "INC-LIVE-777"
+    assert report.dataset_urn == dataset_urn
+    assert requests[0]["incident_id"] == "INC-LIVE-777"
+    assert dataset_urn in rendered
+    assert "inventory_pricing,PROD" not in rendered
+
+
 def test_dashboard_escapes_dynamic_values_and_marks_unknown_control_as_issues(
     tmp_path: Path,
 ) -> None:
     context = _fixture_with_target(
         tmp_path,
-        action="[bold red]UNTRUSTED[/]",
+        action="[bold_red]UNTRUSTED[/]",
         webhook="https://controls.example/fail",
     )
 
     report, rendered = _run(
         context,
         lambda _: httpx.Response(503, text="private failure body must not render"),
-        allowed_endpoints=("https://controls.example/fail",),
+        allowed_controls=(
+            _dynamic_grant(
+                "[bold_red]UNTRUSTED[/]",
+                "https://controls.example/fail",
+            ),
+        ),
     )
 
     assert report.receipts[0].status == "outcome_unknown"
     assert report.receipts[0].error == "remediation outcome unknown after dispatch"
     assert "remediation outcome unknown after dispatch" in rendered
     assert "private failure body must not render" not in rendered
-    assert "[bold red]UNTRUSTED[/]" in rendered
+    assert "[bold_red]UNTRUSTED[/]" in rendered
     assert "COMPLETED WITH ISSUES" in rendered
     assert "all discovered controls succeeded" not in rendered
 
@@ -281,7 +370,7 @@ def test_dashboard_never_calls_nonterminal_receipts_complete(
     report, rendered = _run(
         context,
         lambda _: response,
-        allowed_endpoints=(endpoint,),
+        allowed_controls=(_dynamic_grant("ISSUE_PO", endpoint),),
     )
 
     assert report.receipts[0].status == expected_status

@@ -1,6 +1,5 @@
 import asyncio
 import json
-import re
 import unicodedata
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timezone
@@ -9,7 +8,7 @@ from typing import Any
 import httpx
 import pytest
 
-from compensating_action_engine import CompensatingActionEngine
+from compensating_action_engine import CompensatingActionEngine, RemediationGrant
 from datahub_context import DataHubMCPError, MCPDataHubContext
 from incident_processor import AftershockIncidentProcessor, _single_line
 from remediation_models import IncidentReport, WriteBackReceipt
@@ -91,7 +90,7 @@ def _recorder_with_mixed_targets() -> MCPCallRecorder:
                 MODEL_URN,
                 "ML_MODEL",
                 action=(
-                    "ADJUST|PRICE\nNOW <script>`code` [link](x) *bold*"
+                    "ADJUST|PRICE<script>`code`[link](x)*bold*"
                 ),
                 webhook="https://controls.example/fail?token=private-fragment",
             ),
@@ -103,7 +102,6 @@ def _recorder_with_mixed_targets() -> MCPCallRecorder:
             "message": "saved",
             "author": "urn:li:corpuser:test",
         },
-        echo_saved_urn=True,
     )
 
 
@@ -113,19 +111,35 @@ def _run_processor(
     *,
     incident_id: str = "INC-9942",
     dataset_urn: str = DATASET_URN,
+    milestone_observer=None,
 ) -> IncidentReport:
-    allowed_endpoints: list[str] = []
+    allowed_controls: list[RemediationGrant] = []
     for entity in recorder.entities_payload or []:
+        values_by_name: dict[str, str] = {}
         properties = entity.get("structuredProperties", {}).get("properties", [])
         for property_value in properties:
             definition = property_value.get("structuredProperty", {}).get(
                 "definition", {}
             )
-            if definition.get("qualifiedName") != "aftershock.remediationWebhook":
-                continue
+            qualified_name = definition.get("qualifiedName")
             values = property_value.get("values", [])
-            if values and isinstance(values[0].get("stringValue"), str):
-                allowed_endpoints.append(values[0]["stringValue"])
+            if (
+                isinstance(qualified_name, str)
+                and values
+                and isinstance(values[0].get("stringValue"), str)
+            ):
+                values_by_name[qualified_name] = values[0]["stringValue"]
+        business_action = values_by_name.get("aftershock.businessAction")
+        endpoint = values_by_name.get("aftershock.remediationWebhook")
+        if business_action is not None and endpoint is not None:
+            allowed_controls.append(
+                RemediationGrant(
+                    target_urn=entity["urn"],
+                    entity_type=entity["type"],
+                    business_action=business_action,
+                    endpoint=endpoint,
+                )
+            )
 
     async def scenario() -> IncidentReport:
         context = MCPDataHubContext(client_factory=make_client_factory(recorder))
@@ -136,13 +150,84 @@ def _run_processor(
                 context,
                 CompensatingActionEngine(
                     http_client=client,
-                    allowed_endpoints=allowed_endpoints,
+                    allowed_controls=allowed_controls,
                 ),
                 clock=lambda: FIXED_NOW,
+                milestone_observer=milestone_observer,
             )
             return await processor.process(incident_id, dataset_urn)
 
     return asyncio.run(scenario())
+
+
+def test_processor_announces_truthful_workflow_milestones_in_order() -> None:
+    recorder = _recorder_with_mixed_targets()
+    milestones: list[tuple[str, str]] = []
+
+    def terminal(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "receipt_version": 1,
+                "status": "succeeded",
+                "receipt_id": f"milestone{request.url.path.replace('/', '-')}",
+            },
+        )
+
+    report = _run_processor(
+        recorder,
+        terminal,
+        milestone_observer=lambda phase, detail: milestones.append(
+            (phase, detail)
+        ),
+    )
+
+    assert [phase for phase, _ in milestones] == [
+        "observe",
+        "decide",
+        "act",
+        "persist",
+    ]
+    assert milestones == [
+        ("observe", "reading DataHub lineage and entity metadata"),
+        ("decide", "resolved 3 metadata-backed remediation targets"),
+        ("act", "evaluating 3 targets against exact remediation grants"),
+        ("persist", "saving receipt evidence to DataHub"),
+    ]
+    assert report.writeback.status == "succeeded"
+
+
+def test_milestone_observer_failure_never_changes_the_workflow() -> None:
+    recorder = _recorder_with_mixed_targets()
+    observed_phases: list[str] = []
+
+    def broken_observer(phase: str, _detail: str) -> None:
+        observed_phases.append(phase)
+        raise RuntimeError("presentation observer must not stop remediation")
+
+    def terminal(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "receipt_version": 1,
+                "status": "succeeded",
+                "receipt_id": f"observer{request.url.path.replace('/', '-')}",
+            },
+        )
+
+    report = _run_processor(
+        recorder,
+        terminal,
+        milestone_observer=broken_observer,
+    )
+
+    assert observed_phases == ["observe", "decide", "act", "persist"]
+    assert [receipt.status for receipt in report.receipts] == [
+        "succeeded",
+        "succeeded",
+        "skipped",
+    ]
+    assert report.writeback.status == "succeeded"
 
 
 def test_title_normalization_removes_all_unicode_control_categories() -> None:
@@ -183,7 +268,6 @@ def test_processes_mixed_controls_then_writes_one_complete_mcp_summary() -> None
     assert recorder.events[2:-1] == [
         "http:/succeed",
         "http:/fail",
-        "http:/succeed",
     ]
     assert [name for name, _ in recorder.calls] == [
         "get_lineage",
@@ -201,6 +285,7 @@ def test_processes_mixed_controls_then_writes_one_complete_mcp_summary() -> None
     }
     assert save_arguments["document_type"] == "Summary"
     assert save_arguments["title"] == "Aftershock incident INC-9942"
+    assert save_arguments["urn"] is None
     assert save_arguments["related_assets"] == [
         DATASET_URN,
         DATA_JOB_URN,
@@ -214,7 +299,7 @@ def test_processes_mixed_controls_then_writes_one_complete_mcp_summary() -> None
     assert DATASET_URN in content
     assert "mcp" in content
     assert FIXED_TIMESTAMP in content
-    assert content.count(DATA_JOB_URN) == 2
+    assert content.count(DATA_JOB_URN) == 1
     assert MODEL_URN in content
     assert SKIPPED_URN in content
     assert "succeeded" in content
@@ -223,19 +308,19 @@ def test_processes_mixed_controls_then_writes_one_complete_mcp_summary() -> None
     assert "External receipt ID" in content
     assert "control-succeed" in content
     assert (
-        "ADJUST\\|PRICE<br>NOW &lt;script&gt;&#96;code&#96; "
-        "\\[link\\](x) \\*bold\\*"
+        "ADJUST\\|PRICE&lt;script&gt;&#96;code&#96;"
+        "\\[link\\](x)\\*bold\\*"
     ) in content
-    assert "ADJUST|PRICE\nNOW" not in content
+    assert "ADJUST|PRICE<script>" not in content
     assert "<script>" not in content
     assert "`code`" not in content
     assert "not-in-receipt" not in content
     assert "private-fragment" not in content
     assert "private body" not in content
 
-    assert len(requests) == 3
+    assert len(requests) == 2
     assert json.loads(requests[1].content)["business_action"] == (
-        "ADJUST|PRICE\nNOW <script>`code` [link](x) *bold*"
+        "ADJUST|PRICE<script>`code`[link](x)*bold*"
     )
     assert report == IncidentReport(
         incident_id="INC-9942",
@@ -245,7 +330,7 @@ def test_processes_mixed_controls_then_writes_one_complete_mcp_summary() -> None
         receipts=report.receipts,
         writeback=WriteBackReceipt(
             status="succeeded",
-            document_urn=save_arguments["urn"],
+            document_urn=DOCUMENT_RESULT_URN,
             error=None,
         ),
     )
@@ -253,13 +338,11 @@ def test_processes_mixed_controls_then_writes_one_complete_mcp_summary() -> None
         "succeeded",
         "outcome_unknown",
         "skipped",
-        "succeeded",
     ]
     assert [receipt.external_receipt_id for receipt in report.receipts] == [
         "control-succeed",
         None,
         None,
-        "control-succeed",
     ]
     assert isinstance(report.receipts, tuple)
     assert report.to_dict() == {
@@ -268,7 +351,7 @@ def test_processes_mixed_controls_then_writes_one_complete_mcp_summary() -> None
         "context_mode": "mcp",
         "timestamp": FIXED_TIMESTAMP,
         "counts": {
-            "succeeded": 2,
+            "succeeded": 1,
             "accepted": 0,
             "failed": 0,
             "skipped": 1,
@@ -277,7 +360,7 @@ def test_processes_mixed_controls_then_writes_one_complete_mcp_summary() -> None
         "receipts": [receipt.to_dict() for receipt in report.receipts],
         "writeback": {
             "status": "succeeded",
-            "document_urn": save_arguments["urn"],
+            "document_urn": DOCUMENT_RESULT_URN,
             "error": None,
         },
     }
@@ -285,7 +368,7 @@ def test_processes_mixed_controls_then_writes_one_complete_mcp_summary() -> None
         report.writeback.status = "failed"  # type: ignore[misc]
 
 
-def test_zero_target_incidents_are_written_and_retry_urns_are_safe_and_stable() -> None:
+def test_zero_target_incidents_create_documents_without_forcing_update_urns() -> None:
     recorder = MCPCallRecorder(
         lineage_pages={
             0: {
@@ -299,7 +382,6 @@ def test_zero_target_incidents_are_written_and_retry_urns_are_safe_and_stable() 
             }
         },
         save_payload={"success": True, "urn": DOCUMENT_RESULT_URN},
-        echo_saved_urn=True,
     )
 
     async def handler(_: httpx.Request) -> httpx.Response:
@@ -312,12 +394,7 @@ def test_zero_target_incidents_are_written_and_retry_urns_are_safe_and_stable() 
 
     save_calls = [args for name, args in recorder.calls if name == "save_document"]
     assert len(save_calls) == 3
-    assert save_calls[0]["urn"] == save_calls[1]["urn"]
-    assert save_calls[0]["urn"] != save_calls[2]["urn"]
-    assert re.fullmatch(
-        r"urn:li:document:aftershock-incident-[a-z0-9-]+-[0-9a-f]{32}",
-        save_calls[0]["urn"],
-    )
+    assert [save_call["urn"] for save_call in save_calls] == [None, None, None]
     assert "\n" not in save_calls[0]["title"]
     assert "\r" not in save_calls[0]["title"]
     assert all(
@@ -400,7 +477,7 @@ def test_writeback_failures_are_secret_safe_and_preserve_control_receipts(
     assert recorder.events[-1] == "save_document"
 
 
-def test_valid_but_different_returned_document_urn_is_not_success() -> None:
+def test_server_generated_document_urn_is_accepted_for_a_new_document() -> None:
     recorder = _recorder_with_mixed_targets()
     recorder.lineage_pages[0]["downstreams"]["searchResults"] = []
     recorder.lineage_pages[0]["downstreams"].update(total=0, returned=0)
@@ -416,14 +493,13 @@ def test_valid_but_different_returned_document_urn_is_not_success() -> None:
 
     report = _run_processor(recorder, handler)
 
-    requested_urn = recorder.calls[-1][1]["urn"]
-    assert requested_urn != recorder.save_payload["urn"]
+    assert recorder.calls[-1][1]["urn"] is None
     assert report.writeback == WriteBackReceipt(
-        status="failed",
-        document_urn=None,
-        error=WRITEBACK_ERROR,
+        status="succeeded",
+        document_urn="urn:li:document:server-selected-different-record",
+        error=None,
     )
-    assert "server-selected-different-record" not in json.dumps(report.to_dict())
+    assert "server-selected-different-record" in json.dumps(report.to_dict())
     assert "writeback-secret" not in json.dumps(report.to_dict())
 
 

@@ -1,6 +1,14 @@
-# Deterministic offline examples
+# Aftershock evidence artifacts
 
-These two artifacts were generated together from one actual `run_demo` execution with:
+This directory keeps deterministic fixture artifacts separate from the genuine
+local DataHub MCP proof. None of these files contains a credential or bearer
+token.
+
+## Deterministic offline fixture pair
+
+[`execution_log.txt`](execution_log.txt) and
+[`remediation_report.json`](remediation_report.json) were generated together
+from one actual `run_demo` execution with:
 
 - an explicit `FixtureDataHubContext`;
 - the dashboard's deterministic `httpx.MockTransport` path;
@@ -8,6 +16,35 @@ These two artifacts were generated together from one actual `run_demo` execution
 - `delay=0`; and
 - a plain-text Rich console with a fixed width of 120 columns.
 
-`execution_log.txt` is the console's exported plain-text recording with terminal-only right padding removed from each line and its final newline preserved. `remediation_report.json` is the sorted, indented serialization of the exact `IncidentReport` returned by that same execution.
+`execution_log.txt` is the exported plain-text console recording with
+terminal-only right padding removed and its final newline preserved.
+`remediation_report.json` is the sorted, indented serialization of the exact
+`IncidentReport` returned by the same execution.
 
-These are **OFFLINE FIXTURE MODE** examples. The v1 terminal `succeeded` statuses and external receipt IDs are deterministic reports returned by local `httpx.MockTransport` endpoints; they are not proof that a real business system completed an action. The successful write-back receipt comes from the fixture's in-memory document recorder and does not demonstrate persistence to a running DataHub deployment. No external compensating-control endpoint is called.
+These are **OFFLINE FIXTURE MODE** artifacts. Their terminal `succeeded`
+statuses and external receipt IDs come from local `httpx.MockTransport`
+responses. Their write-back receipt comes from an in-memory document recorder.
+They do not prove that DataHub or an external business system completed an
+action. The final release checklist requires comparison or regeneration after
+the code freeze so the tracked output stays synchronized with the presentation.
+
+## Genuine local DataHub MCP proof
+
+[`live_demo_proof.txt`](live_demo_proof.txt) is a credential-free transcript of
+the dated, verified end-to-end demonstration run on August 4, 2026 against a
+local DataHub OSS Quickstart v1.6.0 instance. It records:
+
+- `LIVE DATAHUB MCP MODE`;
+- receiver BEFORE state: `PO-AFTERSHOCK-001=issued`,
+  `issue_po_enabled=True`, `apply_count=0`;
+- ordered OBSERVE/DECIDE/ACT/PERSIST milestones;
+- one canonical, PO-bound terminal v1 `succeeded` receipt from the loopback
+  receiver;
+- a successful MCP `save_document` result with its generated document URN;
+- receiver AFTER state: `PO-AFTERSHOCK-001=canceled`,
+  `issue_po_enabled=False`, `apply_count=1`; and
+- independent `search_documents`, `grep_documents`, and dataset/DataJob
+  `relatedDocuments` read-back proof.
+
+This file proves the named local run; it does not claim a hosted DataHub service
+or a future rerun. `src/live_demo.py` remains the executable proof gate.

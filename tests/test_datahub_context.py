@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,6 +26,7 @@ from datahub_context import (
 from mcp_test_server import (
     DATASET_URN,
     DATA_JOB_URN,
+    DOCUMENT_URN,
     MODEL_URN,
     MCPCallRecorder,
     make_client_factory,
@@ -34,9 +36,6 @@ from mcp_test_server import (
 FIXTURE_PATH = (
     Path(__file__).resolve().parents[1] / "mock-data" / "datahub_lineage.json"
 )
-DOCUMENT_URN = "urn:li:document:aftershock-inc-9942"
-
-
 def test_get_lineage_uses_real_mcp_and_paginates_downstreams() -> None:
     recorder = MCPCallRecorder(
         lineage_pages={
@@ -71,7 +70,7 @@ def test_get_lineage_uses_real_mcp_and_paginates_downstreams() -> None:
                 "urn": DATASET_URN,
                 "upstream": False,
                 "max_hops": 3,
-                "max_results": 100,
+                "max_results": 10_000,
                 "offset": 0,
             },
         ),
@@ -81,7 +80,7 @@ def test_get_lineage_uses_real_mcp_and_paginates_downstreams() -> None:
                 "urn": DATASET_URN,
                 "upstream": False,
                 "max_hops": 3,
-                "max_results": 100,
+                "max_results": 10_000,
                 "offset": 1,
             },
         ),
@@ -131,7 +130,7 @@ def test_get_lineage_fails_closed_when_has_more_page_is_empty() -> None:
                 "urn": DATASET_URN,
                 "upstream": False,
                 "max_hops": 3,
-                "max_results": 100,
+                "max_results": 10_000,
                 "offset": 0,
             },
         )
@@ -233,6 +232,32 @@ def test_get_lineage_rejects_incomplete_datahub_060_capped_response() -> None:
 
     with pytest.raises(DataHubMCPError, match="incomplete lineage response"):
         asyncio.run(context.get_lineage(DATASET_URN))
+
+
+def test_get_lineage_fetches_enough_for_datahub_060_offset_pagination() -> None:
+    results = [
+        {"entity": {"urn": f"urn:li:dataJob:aftershock-job-{index}"}}
+        for index in range(150)
+    ]
+    recorder = MCPCallRecorder(datahub_060_lineage_results=results)
+    context = MCPDataHubContext(client_factory=make_client_factory(recorder))
+
+    lineage = asyncio.run(context.get_lineage(DATASET_URN))
+
+    assert recorder.calls == [
+        (
+            "get_lineage",
+            {
+                "urn": DATASET_URN,
+                "upstream": False,
+                "max_hops": 3,
+                "max_results": 10_000,
+                "offset": 0,
+            },
+        )
+    ]
+    assert lineage["downstreams"]["searchResults"] == results
+    assert lineage["downstreams"]["returned"] == 150
 
 
 def test_get_lineage_enforces_a_finite_page_limit(monkeypatch) -> None:
@@ -343,6 +368,174 @@ def test_get_entities_normalizes_a_dict_payload() -> None:
     assert entities == [{"urn": DATA_JOB_URN, "type": "DATA_JOB"}]
 
 
+def test_search_documents_sends_bounded_keyword_query_and_validates_results() -> None:
+    recorder = MCPCallRecorder()
+    context = MCPDataHubContext(client_factory=make_client_factory(recorder))
+
+    result = asyncio.run(
+        context.search_documents(
+            query="Aftershock incident INC-9942",
+            num_results=10,
+            offset=0,
+        )
+    )
+
+    assert recorder.calls == [
+        (
+            "search_documents",
+            {
+                "query": "Aftershock incident INC-9942",
+                "num_results": 10,
+                "offset": 0,
+            },
+        )
+    ]
+    entity = result["searchResults"][0]["entity"]
+    assert entity["urn"] == DOCUMENT_URN
+    assert entity["info"]["title"] == "Aftershock incident INC-9942"
+
+
+def test_search_documents_normalizes_a_legitimate_empty_page() -> None:
+    recorder = MCPCallRecorder(
+        search_payload={"start": 0, "count": 10, "total": 0}
+    )
+    context = MCPDataHubContext(client_factory=make_client_factory(recorder))
+
+    result = asyncio.run(context.search_documents(query="not indexed yet"))
+
+    assert result["searchResults"] == []
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [],
+        {},
+        {"start": 0, "count": 1, "total": 1, "searchResults": {}},
+        {"searchResults": [{}]},
+        {
+            "searchResults": [
+                {"entity": {"urn": "not-a-document", "info": {"title": "x"}}}
+            ]
+        },
+        {"searchResults": [{"entity": {"urn": DOCUMENT_URN}}]},
+        {"searchResults": [{"entity": {"urn": DOCUMENT_URN, "info": {"title": 7}}}]},
+        {
+            "start": True,
+            "count": 1,
+            "total": 1,
+            "searchResults": [
+                {"entity": {"urn": DOCUMENT_URN, "info": {"title": "x"}}}
+            ],
+        },
+        {
+            "start": 0,
+            "count": 2,
+            "total": 2,
+            "searchResults": [
+                {"entity": {"urn": DOCUMENT_URN, "info": {"title": "x"}}}
+            ],
+        },
+    ],
+)
+def test_search_documents_rejects_malformed_payloads(payload: Any) -> None:
+    recorder = MCPCallRecorder(search_payload=payload)
+    context = MCPDataHubContext(client_factory=make_client_factory(recorder))
+
+    with pytest.raises(DataHubMCPError, match="search_documents"):
+        asyncio.run(context.search_documents(query="Aftershock"))
+
+
+def test_grep_documents_sends_bounded_query_and_validates_matches() -> None:
+    recorder = MCPCallRecorder()
+    context = MCPDataHubContext(client_factory=make_client_factory(recorder))
+
+    result = asyncio.run(
+        context.grep_documents(
+            urns=[DOCUMENT_URN],
+            pattern="AFTERSHOCK\\-UNIQUE",
+            context_chars=300,
+            max_matches_per_doc=2,
+            start_offset=0,
+        )
+    )
+
+    assert recorder.calls == [
+        (
+            "grep_documents",
+            {
+                "urns": [DOCUMENT_URN],
+                "pattern": "AFTERSHOCK\\-UNIQUE",
+                "context_chars": 300,
+                "max_matches_per_doc": 2,
+                "start_offset": 0,
+            },
+        )
+    ]
+    assert result["results"][0]["urn"] == DOCUMENT_URN
+    assert result["results"][0]["matches"] == [
+        {"excerpt": "marker: AFTERSHOCK-UNIQUE", "position": 8}
+    ]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [],
+        {},
+        {
+            "error": "private server detail",
+            "results": [],
+            "total_matches": 0,
+            "documents_with_matches": 0,
+        },
+        {"results": {}, "total_matches": 0, "documents_with_matches": 0},
+        {"results": [{}], "total_matches": 1, "documents_with_matches": 1},
+        {
+            "results": [
+                {
+                    "urn": DOCUMENT_URN,
+                    "title": "x",
+                    "matches": [{"excerpt": "x", "position": False}],
+                    "total_matches": 1,
+                }
+            ],
+            "total_matches": 1,
+            "documents_with_matches": 1,
+        },
+        {
+            "results": [
+                {
+                    "urn": DOCUMENT_URN,
+                    "title": "x",
+                    "matches": [{"excerpt": "x", "position": 0}],
+                    "total_matches": 2,
+                }
+            ],
+            "total_matches": 1,
+            "documents_with_matches": 1,
+        },
+        {
+            "results": [],
+            "total_matches": 0,
+            "documents_with_matches": 1,
+        },
+    ],
+)
+def test_grep_documents_rejects_malformed_payloads(payload: Any) -> None:
+    recorder = MCPCallRecorder(grep_payload=payload)
+    context = MCPDataHubContext(client_factory=make_client_factory(recorder))
+
+    with pytest.raises(DataHubMCPError, match="grep_documents") as error:
+        asyncio.run(
+            context.grep_documents(
+                urns=[DOCUMENT_URN],
+                pattern="AFTERSHOCK",
+            )
+        )
+    assert "private server detail" not in str(error.value)
+
+
 def test_save_document_sends_exact_arguments_without_topics() -> None:
     recorder = MCPCallRecorder()
     context = MCPDataHubContext(client_factory=make_client_factory(recorder))
@@ -371,6 +564,44 @@ def test_save_document_sends_exact_arguments_without_topics() -> None:
     ]
     assert result["success"] is True
     assert result["urn"] == DOCUMENT_URN
+
+
+def test_save_document_omits_urn_when_creating_a_new_document() -> None:
+    captured: dict[str, Any] = {}
+    context = MCPDataHubContext(client_factory=lambda: None)  # type: ignore[arg-type]
+
+    async def capture_call(
+        tool_name: str, arguments: dict[str, Any]
+    ) -> dict[str, Any]:
+        captured["tool_name"] = tool_name
+        captured["arguments"] = arguments
+        return {
+            "success": True,
+            "urn": "urn:li:document:datahub-generated-document",
+        }
+
+    context._call_tool = capture_call  # type: ignore[method-assign]
+
+    result = asyncio.run(
+        context.save_document(
+            document_type="Summary",
+            title="Aftershock incident INC-9942",
+            content="# Verified receipts",
+            urn=None,
+            related_assets=[DATASET_URN],
+        )
+    )
+
+    assert captured == {
+        "tool_name": "save_document",
+        "arguments": {
+            "document_type": "Summary",
+            "title": "Aftershock incident INC-9942",
+            "content": "# Verified receipts",
+            "related_assets": [DATASET_URN],
+        },
+    }
+    assert result["urn"] == "urn:li:document:datahub-generated-document"
 
 
 def test_mcp_tool_error_is_wrapped_without_leaking_server_details() -> None:
@@ -531,6 +762,15 @@ def test_fixture_context_reads_lineage_entities_and_records_writeback() -> None:
             related_assets=[DATASET_URN, MODEL_URN, DATA_JOB_URN],
         )
     )
+    search_result = asyncio.run(
+        context.search_documents(query="Aftershock incident INC-9942")
+    )
+    grep_result = asyncio.run(
+        context.grep_documents(urns=[DOCUMENT_URN], pattern="Fixture")
+    )
+    related_entities = asyncio.run(
+        context.get_entities([DATA_JOB_URN, MODEL_URN])
+    )
 
     assert context.mode == "fixture"
     assert len(lineage["downstreams"]["searchResults"]) == 2
@@ -550,6 +790,19 @@ def test_fixture_context_reads_lineage_entities_and_records_writeback() -> None:
         "message": "Recorded by the in-memory fixture recorder",
         "author": "aftershock-fixture",
     }
+    assert search_result["searchResults"][0]["entity"] == {
+        "urn": DOCUMENT_URN,
+        "subType": "Summary",
+        "info": {"title": "Aftershock incident INC-9942"},
+    }
+    assert grep_result["results"][0]["urn"] == DOCUMENT_URN
+    assert grep_result["results"][0]["matches"][0]["excerpt"] == (
+        "# Fixture receipts"
+    )
+    assert all(
+        entity["relatedDocuments"]["documents"][0]["urn"] == DOCUMENT_URN
+        for entity in related_entities
+    )
 
 
 def test_mode_factory_requires_an_explicit_valid_mode(monkeypatch) -> None:
@@ -646,6 +899,58 @@ def test_remote_transport_uses_only_the_separate_mcp_bearer_token(
 
 
 @pytest.mark.parametrize(
+    "mcp_url",
+    [
+        "http://mcp.example.test/context",
+        "ftp://mcp.example.test/context",
+        "https://user:password@mcp.example.test/context",
+        "https://mcp.example.test/context#fragment",
+        " https://mcp.example.test/context",
+        "https://mcp.example.test/context\n",
+        "https://mcp.example.test:70000/context",
+        "https:///context",
+        "https://mcp.example.test/con\x00text",
+    ],
+)
+def test_remote_transport_rejects_unsafe_mcp_urls(mcp_url: str) -> None:
+    with pytest.raises(DataHubConfigurationError, match="DATAHUB_MCP_URL"):
+        build_mcp_client_factory({"DATAHUB_MCP_URL": mcp_url})
+
+
+@pytest.mark.parametrize(
+    "mcp_url",
+    [
+        "http://localhost:8000/mcp",
+        "http://127.0.0.1:8000/mcp",
+        "http://[::1]:8000/mcp",
+    ],
+)
+def test_remote_transport_allows_plain_http_only_for_loopback(
+    mcp_url: str,
+) -> None:
+    assert callable(build_mcp_client_factory({"DATAHUB_MCP_URL": mcp_url}))
+
+
+@pytest.mark.parametrize(
+    "gms_url",
+    [
+        "http://gms.example.test:8080",
+        "ftp://gms.example.test/context",
+        "https://user:password@gms.example.test/context",
+        "https://gms.example.test/context#fragment",
+        " https://gms.example.test/context",
+        "https://gms.example.test/context\n",
+        "https://gms.example.test:70000/context",
+        "https:///context",
+        "https://gms.example.test/con\x00text",
+    ],
+)
+def test_stdio_transport_rejects_unsafe_gms_urls(gms_url: str) -> None:
+    with pytest.raises(DataHubConfigurationError, match="DATAHUB_GMS_URL"):
+        build_mcp_client_factory({"DATAHUB_GMS_URL": gms_url})
+
+
+@pytest.mark.parametrize(
     "environ",
     [
         {"PATH": "test-path"},
@@ -672,12 +977,14 @@ def test_stdio_transport_receives_only_local_datahub_credentials(
             args: list[str],
             env: dict[str, str],
             keep_alive: bool,
+            log_file: Path,
         ) -> None:
             captured.update(
                 command=command,
                 args=args,
                 env=env,
                 keep_alive=keep_alive,
+                log_file=log_file,
             )
 
     class FakeClient:
@@ -716,6 +1023,7 @@ def test_stdio_transport_receives_only_local_datahub_credentials(
         "stdio",
     ]
     assert captured["keep_alive"] is False
+    assert captured["log_file"] == Path(os.devnull)
     assert captured["env"] == {
         "PATH": "test-path",
         "SYSTEMROOT": "C:\\Windows",

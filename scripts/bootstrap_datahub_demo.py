@@ -212,7 +212,10 @@ def execute_bootstrap(
         raise ValueError("DATAHUB_GMS_URL is invalid or unsafe") from None
     if confirm_target != target_origin:
         raise ValueError("target confirmation does not match DATAHUB_GMS_URL origin")
-    if not _is_loopback_host(target_host) and not allow_remote_target:
+    target_is_loopback = _is_loopback_host(target_host)
+    if not target_is_loopback and target_origin.startswith("http://"):
+        raise ValueError("remote DataHub target requires HTTPS")
+    if not target_is_loopback and not allow_remote_target:
         raise ValueError(
             "remote DataHub target requires --allow-remote-target"
         )

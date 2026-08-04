@@ -85,7 +85,7 @@ def _single_lineage_page(
     }
 
 
-def test_maps_batched_mcp_entities_by_urn_and_preserves_lineage_order() -> None:
+def test_maps_batched_mcp_entities_by_urn_and_deduplicates_lineage_order() -> None:
     recorder = MCPCallRecorder(
         lineage_pages={
             0: {
@@ -142,7 +142,6 @@ def test_maps_batched_mcp_entities_by_urn_and_preserves_lineage_order() -> None:
             "ISSUE_PO",
             "https://api.internal.example/remediate/cancel_po",
         ),
-        ActionableTarget(MODEL_URN, "ML_MODEL", "ADJUST_PRICE", None),
     ]
     assert recorder.calls == [
         (
@@ -151,7 +150,7 @@ def test_maps_batched_mcp_entities_by_urn_and_preserves_lineage_order() -> None:
                 "urn": DATASET_URN,
                 "upstream": False,
                 "max_hops": 3,
-                "max_results": 100,
+                    "max_results": 10_000,
                 "offset": 0,
             },
         ),
@@ -163,6 +162,118 @@ def test_maps_batched_mcp_entities_by_urn_and_preserves_lineage_order() -> None:
         "business_action": "ISSUE_PO",
         "remediation_webhook": "https://api.internal.example/remediate/cancel_po",
     }
+
+
+def test_duplicate_structured_property_assignments_fail_closed() -> None:
+    detail = _complete_entity(
+        DATA_JOB_URN,
+        "DATA_JOB",
+        "ISSUE_PO",
+        "https://api.internal.example/remediate/cancel_po",
+    )
+    detail["structuredProperties"]["properties"].append(
+        _property(
+            "aftershock.businessAction",
+            {"stringValue": "PAUSE_PIPELINE"},
+        )
+    )
+    recorder = MCPCallRecorder(
+        lineage_pages=_single_lineage_page(),
+        entities_payload=[detail],
+    )
+    context = MCPDataHubContext(client_factory=make_client_factory(recorder))
+
+    targets = asyncio.run(BlastRadiusMapper(context).get_targets(DATASET_URN))
+
+    assert targets == [
+        ActionableTarget(
+            DATA_JOB_URN,
+            "DATA_JOB",
+            None,
+            "https://api.internal.example/remediate/cancel_po",
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        [],
+        [{"stringValue": "ISSUE_PO"}, {"stringValue": "PAUSE_PIPELINE"}],
+        [{"numberValue": 7}],
+        ["ISSUE_PO"],
+    ],
+    ids=["no-value", "multiple-values", "not-string-valued", "not-value-object"],
+)
+def test_structured_property_requires_exactly_one_string_value_object(
+    values: list[Any],
+) -> None:
+    detail = _complete_entity(
+        DATA_JOB_URN,
+        "DATA_JOB",
+        "ISSUE_PO",
+        "https://api.internal.example/remediate/cancel_po",
+    )
+    detail["structuredProperties"]["properties"][0]["values"] = values
+    recorder = MCPCallRecorder(
+        lineage_pages=_single_lineage_page(),
+        entities_payload=[detail],
+    )
+    context = MCPDataHubContext(client_factory=make_client_factory(recorder))
+
+    targets = asyncio.run(BlastRadiusMapper(context).get_targets(DATASET_URN))
+
+    assert targets[0].business_action is None
+
+
+@pytest.mark.parametrize(
+    "unsafe_value",
+    [
+        "",
+        " ISSUE_PO",
+        "ISSUE_PO ",
+        "ISSUE\nPO",
+        "ISSUE\u202ePO",
+    ],
+    ids=["empty", "leading-space", "trailing-space", "control", "bidi-control"],
+)
+def test_structured_property_rejects_noncanonical_or_controlled_strings(
+    unsafe_value: str,
+) -> None:
+    detail = _complete_entity(
+        DATA_JOB_URN,
+        "DATA_JOB",
+        unsafe_value,
+        "https://api.internal.example/remediate/cancel_po",
+    )
+    recorder = MCPCallRecorder(
+        lineage_pages=_single_lineage_page(),
+        entities_payload=[detail],
+    )
+    context = MCPDataHubContext(client_factory=make_client_factory(recorder))
+
+    targets = asyncio.run(BlastRadiusMapper(context).get_targets(DATASET_URN))
+
+    assert targets[0].business_action is None
+
+
+def test_structured_property_returns_the_exact_non_normalized_string() -> None:
+    decomposed = "ISSUE_PO\u0301"
+    detail = _complete_entity(
+        DATA_JOB_URN,
+        "DATA_JOB",
+        decomposed,
+        "https://api.internal.example/remediate/cancel_po",
+    )
+    recorder = MCPCallRecorder(
+        lineage_pages=_single_lineage_page(),
+        entities_payload=[detail],
+    )
+    context = MCPDataHubContext(client_factory=make_client_factory(recorder))
+
+    targets = asyncio.run(BlastRadiusMapper(context).get_targets(DATASET_URN))
+
+    assert targets[0].business_action == decomposed
 
 
 def test_preserves_nodes_when_details_are_missing_or_report_an_error() -> None:

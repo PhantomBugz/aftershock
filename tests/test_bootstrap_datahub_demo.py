@@ -289,6 +289,31 @@ def test_apply_refuses_remote_target_without_explicit_override() -> None:
     assert events == []
 
 
+@pytest.mark.parametrize("allow_remote_target", [False, True])
+@pytest.mark.parametrize("token", [None, "REMOTE-GMS-TOKEN"])
+def test_apply_rejects_remote_http_before_any_work(
+    allow_remote_target: bool,
+    token: str | None,
+) -> None:
+    bootstrap = _bootstrap_module()
+    events: list[str] = []
+    environ = {"DATAHUB_GMS_URL": "http://datahub.example:8080/api"}
+    if token is not None:
+        environ["DATAHUB_GMS_TOKEN"] = token
+
+    with pytest.raises(ValueError, match="remote DataHub target requires HTTPS"):
+        bootstrap.execute_bootstrap(
+            mode="apply",
+            environ=environ,
+            confirm_target="http://datahub.example:8080",
+            allow_remote_target=allow_remote_target,
+            client_factory=lambda **kwargs: events.append("client"),
+            definitions_runner=lambda *args, **kwargs: events.append("definitions"),
+        )
+
+    assert events == []
+
+
 def test_apply_defines_properties_then_upserts_three_assets_and_one_exact_edge() -> None:
     bootstrap = _bootstrap_module()
     events: list[tuple[str, Any]] = []
@@ -392,8 +417,12 @@ def test_apply_defines_properties_then_upserts_three_assets_and_one_exact_edge()
     assert "mlModel" not in serialized
 
 
-def test_apply_remote_override_allows_confirmed_target() -> None:
+@pytest.mark.parametrize("token", [None, "REMOTE-GMS-TOKEN"])
+def test_apply_remote_override_allows_confirmed_https_target(
+    token: str | None,
+) -> None:
     bootstrap = _bootstrap_module()
+    captured: dict[str, Any] = {}
 
     class Entities:
         def get(self, urn: str) -> object:
@@ -410,16 +439,27 @@ def test_apply_remote_override_allows_confirmed_target() -> None:
         entities = Entities()
         lineage = Lineage()
 
+    environ = {
+        "DATAHUB_GMS_URL": "https://datahub.example/api?token=secret"
+    }
+    if token is not None:
+        environ["DATAHUB_GMS_TOKEN"] = token
+
+    def client_factory(**kwargs: Any) -> Client:
+        captured.update(kwargs)
+        return Client()
+
     result = bootstrap.execute_bootstrap(
         mode="apply",
-        environ={"DATAHUB_GMS_URL": "https://datahub.example/api?token=secret"},
+        environ=environ,
         confirm_target="https://datahub.example:443",
         allow_remote_target=True,
-        client_factory=lambda **kwargs: Client(),
+        client_factory=client_factory,
         definitions_runner=lambda *args, **kwargs: None,
     )
 
     assert result["target_origin"] == "https://datahub.example:443"
+    assert captured["config"].token == token
 
 
 def test_apply_refuses_existing_assets_before_any_mutation() -> None:

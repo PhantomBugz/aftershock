@@ -14,7 +14,10 @@ from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn
 from rich.table import Table
 from rich.tree import Tree
 
-from compensating_action_engine import CompensatingActionEngine
+from compensating_action_engine import (
+    CompensatingActionEngine,
+    RemediationGrant,
+)
 from datahub_context import DataHubContextPort, FixtureDataHubContext
 from incident_processor import AftershockIncidentProcessor
 from remediation_models import IncidentReport
@@ -24,9 +27,25 @@ DEMO_DATASET_URN = (
     "urn:li:dataset:(urn:li:dataPlatform:postgres,inventory_pricing,PROD)"
 )
 DEMO_INCIDENT_ID = "INC-9942"
-DEMO_FIXTURE_ENDPOINTS = (
-    "https://api.internal.example/remediate/cancel_po",
-    "https://api.internal.example/remediate/revert_pricing",
+DEMO_FIXTURE_GRANTS = (
+    RemediationGrant(
+        target_urn=(
+            "urn:li:dataJob:(urn:li:dataFlow:(airflow,aftershock_demo,PROD),"
+            "purchase_order_generator)"
+        ),
+        entity_type="DATA_JOB",
+        business_action="ISSUE_PO",
+        endpoint="https://api.internal.example/remediate/cancel_po",
+    ),
+    RemediationGrant(
+        target_urn=(
+            "urn:li:mlModel:(urn:li:dataPlatform:sagemaker,"
+            "dynamic_pricing_model,PROD)"
+        ),
+        entity_type="ML_MODEL",
+        business_action="ADJUST_PRICE",
+        endpoint="https://api.internal.example/remediate/revert_pricing",
+    ),
 )
 Clock = Callable[[], datetime]
 
@@ -88,7 +107,9 @@ async def run_demo(
     console: Console | None = None,
     context: DataHubContextPort | None = None,
     http_client: httpx.AsyncClient | None = None,
-    remediation_allowlist: Collection[str] | None = None,
+    remediation_grants: Collection[RemediationGrant] | None = None,
+    incident_id: str = DEMO_INCIDENT_ID,
+    dataset_urn: str = DEMO_DATASET_URN,
     clock: Clock | None = None,
     delay: float = 1.5,
 ) -> IncidentReport:
@@ -97,18 +118,28 @@ async def run_demo(
     active_console = console or Console()
     active_context = context or FixtureDataHubContext()
     fixture_mode = active_context.mode == "fixture"
+    mixed_mode = fixture_mode and http_client is not None
     if not fixture_mode and http_client is None:
         raise ValueError("http_client is required for non-fixture context")
-    if remediation_allowlist is None:
+    if remediation_grants is None:
         if not fixture_mode:
             raise ValueError(
-                "remediation_allowlist is required for non-fixture context"
+                "remediation_grants is required for non-fixture context"
             )
-        active_allowlist = DEMO_FIXTURE_ENDPOINTS
+        active_grants = DEMO_FIXTURE_GRANTS
     else:
-        active_allowlist = tuple(remediation_allowlist)
+        active_grants = tuple(remediation_grants)
 
-    if fixture_mode:
+    if mixed_mode:
+        active_console.print(
+            Panel.fit(
+                "[bold white]MIXED DEMO MODE[/]\n"
+                "DataHub lineage and write-back use the local fixture; "
+                "remediation uses a caller-supplied HTTP transport.",
+                border_style="bright_yellow",
+            )
+        )
+    elif fixture_mode:
         active_console.print(
             Panel.fit(
                 "[bold white]OFFLINE FIXTURE MODE[/]\n"
@@ -120,7 +151,7 @@ async def run_demo(
     else:
         active_console.print(
             Panel.fit(
-                "[bold white]MCP MODE[/]\n"
+                "[bold white]LIVE DATAHUB MCP MODE[/]\n"
                 "Results shown below are the receipts returned by the "
                 "configured services.",
                 border_style="bright_cyan",
@@ -131,7 +162,7 @@ async def run_demo(
         Panel.fit(
             "[bold white]CRITICAL INCIDENT DETECTED[/]\n\n"
             '"[bold bright_red]Pricing Decimal Shift[/]" identified in '
-            "[bold cyan]inventory_pricing[/].\n"
+            f"[bold cyan]{_safe(dataset_urn)}[/].\n"
             "[yellow]Aftershock normalized incident envelope received.[/]",
             title="[bold red]ACT 1  //  THE FAULT[/]",
             border_style="bright_red",
@@ -150,14 +181,6 @@ async def run_demo(
     )
 
     async def process(client: httpx.AsyncClient) -> IncidentReport:
-        processor = AftershockIncidentProcessor(
-            active_context,
-            CompensatingActionEngine(
-                http_client=client,
-                allowed_endpoints=active_allowlist,
-            ),
-            clock=clock,
-        )
         with Progress(
             SpinnerColumn(style="bold bright_cyan"),
             TextColumn("[bold bright_cyan]{task.description}"),
@@ -167,10 +190,42 @@ async def run_demo(
         ) as progress:
             task_id = progress.add_task(
                 "Executing full workflow: lineage + controls + save_document...",
-                total=1,
+                total=4,
             )
-            report = await processor.process(DEMO_INCIDENT_ID, DEMO_DATASET_URN)
-            progress.update(task_id, completed=1)
+
+            phase_index = {
+                "observe": 0,
+                "decide": 1,
+                "act": 2,
+                "persist": 3,
+            }
+
+            def show_milestone(phase: str, detail: str) -> None:
+                active_console.print(
+                    f"[bold bright_cyan]{phase.upper()}  //  "
+                    f"{_safe(detail)}[/]"
+                )
+                progress.update(
+                    task_id,
+                    completed=phase_index[phase],
+                    description=f"{phase.upper()}: {detail}",
+                )
+
+            processor = AftershockIncidentProcessor(
+                active_context,
+                CompensatingActionEngine(
+                    http_client=client,
+                    allowed_controls=active_grants,
+                ),
+                clock=clock,
+                milestone_observer=show_milestone,
+            )
+            report = await processor.process(incident_id, dataset_urn)
+            progress.update(
+                task_id,
+                completed=4,
+                description="WORKFLOW SETTLED",
+            )
         return report
 
     if http_client is not None:

@@ -8,6 +8,7 @@ import re
 import unicodedata
 from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
+from typing import Literal
 
 from blast_radius_mapper import BlastRadiusMapper
 from compensating_action_engine import CompensatingActionEngine
@@ -21,6 +22,8 @@ from remediation_models import (
 
 logger = logging.getLogger("Aftershock-Processor")
 Clock = Callable[[], datetime]
+WorkflowPhase = Literal["observe", "decide", "act", "persist"]
+MilestoneObserver = Callable[[WorkflowPhase, str], None]
 _WRITEBACK_ERROR = "DataHub remediation record persistence failed"
 _DOCUMENT_URN_PATTERN = re.compile(r"urn:li:document:[^\s\x00-\x1f\x7f]+\Z")
 
@@ -34,11 +37,23 @@ class AftershockIncidentProcessor:
         engine: CompensatingActionEngine,
         *,
         clock: Clock | None = None,
+        milestone_observer: MilestoneObserver | None = None,
     ) -> None:
         self.context = context
         self.engine = engine
         self.mapper = BlastRadiusMapper(context)
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._milestone_observer = milestone_observer
+
+    def _announce(self, phase: WorkflowPhase, detail: str) -> None:
+        """Notify presentation observers without changing workflow behavior."""
+
+        if self._milestone_observer is None:
+            return
+        try:
+            self._milestone_observer(phase, detail)
+        except Exception:
+            logger.warning("Aftershock workflow milestone observer failed")
 
     async def process(
         self, incident_id: str, dataset_urn: str
@@ -51,12 +66,22 @@ class AftershockIncidentProcessor:
         """
 
         timestamp = _utc_timestamp(self._clock())
+        self._announce(
+            "observe", "reading DataHub lineage and entity metadata"
+        )
         targets = await self.mapper.get_targets(dataset_urn)
+        self._announce(
+            "decide",
+            f"resolved {len(targets)} metadata-backed remediation targets",
+        )
+        self._announce(
+            "act",
+            f"evaluating {len(targets)} targets against exact remediation grants",
+        )
         receipts = tuple(
             await self.engine.process_blast_radius(targets, incident_id)
         )
 
-        document_urn = _incident_document_urn(incident_id, dataset_urn)
         related_assets = list(
             dict.fromkeys([dataset_urn, *(target.urn for target in targets)])
         )
@@ -68,17 +93,19 @@ class AftershockIncidentProcessor:
             receipts=receipts,
         )
 
+        self._announce("persist", "saving receipt evidence to DataHub")
         try:
             result = await self.context.save_document(
                 document_type="Summary",
                 title=f"Aftershock incident {_single_line(incident_id)}",
                 content=content,
-                urn=document_urn,
+                # Omitting the URN is the official create contract. Supplying
+                # a new URN asks DataHub to update a record that does not exist
+                # and is rejected by the server's default update restriction.
+                urn=None,
                 related_assets=related_assets,
             )
-            saved_urn = _saved_document_urn(
-                result, expected_urn=document_urn
-            )
+            saved_urn = _saved_document_urn(result)
         except Exception:
             # MCP/server details can contain credentials or response content.
             # Keep the external receipt fixed and log no exception text.
@@ -130,13 +157,15 @@ def _incident_document_urn(incident_id: str, dataset_urn: str) -> str:
     return f"urn:li:document:aftershock-incident-{slug}-{digest}"
 
 
-def _saved_document_urn(result: object, *, expected_urn: str) -> str:
+def _saved_document_urn(
+    result: object, *, expected_urn: str | None = None
+) -> str:
     if not isinstance(result, Mapping) or result.get("success") is not True:
         raise ValueError("invalid DataHub save result")
     urn = result.get("urn")
     if not isinstance(urn, str) or not _DOCUMENT_URN_PATTERN.fullmatch(urn):
         raise ValueError("invalid DataHub document URN")
-    if urn != expected_urn:
+    if expected_urn is not None and urn != expected_urn:
         raise ValueError("DataHub returned a different document URN")
     return urn
 

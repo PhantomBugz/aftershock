@@ -5,108 +5,124 @@
 ## Inspiration
 
 Data-quality tools can identify an unreliable dataset, and lineage can show
-which systems are downstream. But an automated job or model may already be
-acting on that data. Repairing the dataset does not settle the operational
-follow-up. We call that follow-up **Action Debt**.
+which systems are downstream. But an automated job may already be acting on
+that data. In the demonstrated scenario, bad pricing has already issued a
+purchase order. Repairing the table does not cancel it or stop the next one. We
+call that unresolved operational follow-up **Action Debt**.
 
 ## What it does
 
-Aftershock is a deterministic, policy-driven agent loop built on DataHub:
+Aftershock is a deterministic, auditable agent loop built on DataHub:
 
 1. **Observe:** read downstream lineage and entity context through DataHub MCP.
-2. **Decide:** resolve structured playbook metadata and enforce an exact
-   operator-provided endpoint policy.
-3. **Act:** invoke bounded compensating controls.
-4. **Persist memory:** write the factual receipt summary back with
-   `save_document` so the next operator or agent inherits it.
+2. **Decide:** resolve structured playbook metadata and require an exact
+   operator grant for the target URN, entity type, business action, and endpoint.
+3. **Act:** invoke a bounded compensating control and require a factual terminal
+   receipt rather than inferring success from HTTP alone.
+4. **Persist:** write the incident, action receipt, and related assets back to
+   DataHub, then independently read them back.
 
-This is an agent because it closes that governed loop after an authenticated
-trigger. It does not claim generative or LLM reasoning.
+The demonstrated decision loop is policy-driven, autonomous after its trigger,
+and reproducible from governed context and policy.
 
 ## How DataHub is foundational
 
-- `get_lineage(upstream=false)` discovers downstream exposure. In the pinned
-  server contract, `max_hops=3` requests unlimited traversal rather than a
-  finite hop boundary.
-- `get_entities` resolves exposed assets and their structured properties.
-- `aftershock.businessAction` and `aftershock.remediationWebhook` provide the
-  governed control mapping.
-- `save_document` persists receipt evidence and related asset URNs back into
-  DataHub.
+Aftershock extends DataHub instead of rebuilding its catalog:
 
-The implementation uses `mcp-server-datahub==0.6.0` over FastMCP. A failed
-live MCP call fails closed and never changes to fixture data.
+- `get_lineage(upstream=false)` discovers downstream exposure.
+- `get_entities` resolves assets plus the governed structured properties
+  `aftershock.businessAction` and `aftershock.remediationWebhook`.
+- `save_document` creates durable incident memory related to the source dataset
+  and downstream job.
+- `search_documents` proves the generated document URN and exact title.
+- `grep_documents` proves the incident and external receipt IDs were persisted.
+- a second `get_entities` read proves both related assets link back to the saved
+  document.
+
+The implementation uses the official `mcp-server-datahub==0.6.0` through
+FastMCP. Live failures fail closed and never switch to fixture data.
+
+## Functioning live demonstration
+
+The primary demo runs against a local DataHub OSS Quickstart v1.6.0 instance
+and a built-in loopback-only receiver. The receiver starts with purchase order
+`PO-AFTERSHOCK-001` already `issued` and further issuance enabled. Aftershock
+reads the seeded lineage and playbook metadata, authorizes exactly one
+`ISSUE_PO` compensation, and sends the cancellation control.
+
+The receiver returns one canonical, PO-bound terminal v1 receipt, changes the
+order from `issued` to `canceled`, disables further issuance, and increments
+`apply_count` from zero to one. Sequential and concurrent retries resolve to
+the same receipt rather than manufacturing additional success. Aftershock then
+saves that receipt summary to DataHub and requires all three independent
+read-back checks to pass before displaying
+`LIVE DATAHUB READBACK VERIFIED`.
+
+On August 4, 2026, the complete OBSERVE/DECIDE/ACT/PERSIST path succeeded. The
+saved record was visible in the local DataHub UI and linked to both the dataset
+and DataJob. A separate opt-in live MCP contract test also passed (`1 passed in
+27.59s`). The deterministic offline suite passed `309` tests with the one live
+test skipped only when its explicit opt-in was absent.
 
 ## Receipts, not inferred outcomes
 
-Aftershock reports five states: `succeeded`, `accepted`, `failed`, `skipped`,
-and `outcome_unknown`. A control is `succeeded` only when an eligible non-202
-response contains this terminal v1 contract with a valid external receipt ID:
+A control succeeds only when the receiver returns the strict terminal contract:
 
 ```json
 {"receipt_version": 1, "status": "succeeded", "receipt_id": "..."}
 ```
 
-HTTP 202 and accepted/pending receipts on ordinary success-class responses are
-nonterminal. A 4xx other than 408 is a failed rejection. HTTP 408 and 5xx are
-`outcome_unknown` unless they carry a valid v1 terminal success/failure receipt,
-which is honored. Transport failure, deadline expiry after dispatch, or a 2xx
-without the terminal contract is also `outcome_unknown`; undispatched work is
-`skipped`. HTTP transport success alone is never presented as business success.
+Aftershock distinguishes `succeeded`, `accepted`, `failed`, `skipped`, and
+`outcome_unknown`. HTTP 202 is nonterminal. Ambiguous timeouts and 5xx responses
+remain unknown unless a valid terminal receipt proves the outcome. A stable
+idempotency key supports safe receiver-side replay, while bounded concurrency,
+a workflow deadline, disabled redirects, and a 64 KiB response limit constrain
+execution.
 
-Overall completion requires every discovered target to return terminal success
-and the DataHub write-back to succeed. The dashboard and saved document include
-external receipt IDs and preserve unresolved states.
-
-## Governed execution
-
-The listener requires a nonempty exact URL allowlist. User information and
-fragments are forbidden, nonloopback endpoints require HTTPS, paths and queries
-are authorized exactly, and redirects are disabled. The engine bounds worker
-concurrency and the workflow deadline. A deterministic idempotency key supports
-receiver-side deduplication but is not exactly-once proof.
-
-DataHub RBAC, network egress, receiver authentication, and credential handling
-remain operator responsibilities. Credentials do not belong in DataHub
-properties or endpoint URLs.
+Overall completion requires every discovered target to succeed and the DataHub
+write-back to succeed.
 
 ## Why it is different
 
-Aftershock composes catalog context with an operational control loop. It goes
-beyond displaying impact: governed DataHub metadata determines which controls
-may be attempted, and DataHub receives the resulting evidence. The project
-extends DataHub rather than rebuilding its catalog or lineage.
+Most lineage tools stop at “what might be affected?” Aftershock turns governed
+catalog context into a bounded operational response and returns the evidence to
+the catalog. **Action Debt** names the real-world gap between finding unreliable
+data and settling the downstream actions it already triggered.
 
-## Demo and technical execution
+The purchase-order scenario makes that value concrete: a bad pricing feed can
+be discovered in DataHub, the exposed ordering job can be identified, an
+already-issued order can be canceled, further issuance can be stopped through
+an exact grant, and the resulting PO-bound receipt can be preserved for the
+next operator or agent.
 
-The terminal demonstration is explicitly labeled **OFFLINE FIXTURE MODE**. It
-uses deterministic lineage, an in-memory exact allowlist, mocked HTTP responses
-with valid terminal receipt IDs, and an in-memory document recorder. The test
-suite separately performs genuine MCP/JSON-RPC exchanges against an in-process
-FastMCP server and tests pagination, policy denial, redirects, deadlines,
-receipt classification, API authentication, and `save_document` arguments.
+## Technical execution and safety
 
-A live MCP adapter, safe `DEV` bootstrap, and opt-in live test are included.
-Live persistence was not run in the development environment because no live
-DataHub deployment was available; a skipped live test is not evidence of a
-live result.
+- Exact immutable grants bind asset, entity type, business action, and endpoint.
+- Plain HTTP is permitted only on loopback; nonloopback controls require HTTPS.
+- User information and fragments are rejected and redirects are disabled.
+- The receiver exposes an observable before/after state and deterministic replay
+  behavior.
+- Distinct sequential or concurrent retry keys return the one canonical
+  cancellation receipt; retarget attempts fail.
+- MCP payloads and document read-back are strictly validated and deadline-bound.
+- Credentials never belong in DataHub properties, URLs, screenshots, or proof
+  transcripts.
 
-## Event integration boundary
+DataHub RBAC, production receiver authentication, and infrastructure egress
+policy remain operator responsibilities.
 
-The FastAPI route begins after an authenticated Aftershock-normalized incident
-trigger. In production, a custom DataHub Action would translate an
-`incidentInfo` MetadataChangeLogEvent into that contract. That adapter is not
-implemented in this MVP.
+## Current boundary and next step
 
-## Current limit and next step
+The FastAPI endpoint begins after an authenticated, normalized incident trigger.
+A production deployment would translate a DataHub `incidentInfo`
+MetadataChangeLogEvent through a custom DataHub Action; that adapter is future
+integration work.
 
-The MVP proves system-level exposure discovery, governed control attempts, and
-factual receipts. Lineage alone does not establish which individual records a
-downstream system read or which external actions followed. The proposed
-Action-Provenance Ledger would add stable action IDs, incident windows,
-coverage evidence, and append-oriented control receipts for more selective
-recovery.
+The MVP proves system-level exposure and compensating-control receipts, not
+row-level causality. The proposed Action-Provenance Ledger would add stable
+action IDs, incident windows, and coverage evidence for more selective recovery.
 
 ## Built with
 
-Python 3.12, DataHub MCP Server, FastMCP, FastAPI, HTTPX, Rich, and pytest.
+Python 3.12, DataHub OSS, DataHub MCP Server, FastMCP, FastAPI, HTTPX, Rich, and
+pytest. The project is open source under Apache License 2.0.

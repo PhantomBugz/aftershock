@@ -1,0 +1,47 @@
+Aftershock live-demo proof transcript
+Captured: 2026-08-04 (America/New_York)
+DataHub: local OSS Quickstart v1.6.0
+Execution mode: LIVE DATAHUB MCP MODE
+
+Command:
+  python src\live_demo.py
+
+RECEIVER BEFORE
+  purchase_order_id: PO-AFTERSHOCK-001
+  purchase_order_status: issued
+  issue_po_enabled: True
+  apply_count: 0
+
+OBSERVE  //  reading DataHub lineage and entity metadata
+DECIDE   //  resolved 1 metadata-backed remediation targets
+ACT      //  evaluating 1 targets against exact remediation grants
+PERSIST  //  saving receipt evidence to DataHub
+
+Terminal control receipt
+  status: succeeded
+  HTTP: 200
+  external_receipt_id: aftershock-demo-succeeded-PO-AFTERSHOCK-001-ea74bcc907123906e7fbaf52
+  endpoint: http://127.0.0.1:8765/remediate/cancel_po
+
+DataHub write-back
+  status: succeeded
+  document_urn: urn:li:document:shared-015c94ed-69c0-40a6-a851-ce76a4920616
+
+RECEIVER AFTER
+  purchase_order_id: PO-AFTERSHOCK-001
+  purchase_order_status: canceled
+  issue_po_enabled: False
+  apply_count: 1
+  last_incident_id: INC-LIVE-001
+  last_receipt_id: aftershock-demo-succeeded-PO-AFTERSHOCK-001-ea74bcc907123906e7fbaf52
+
+LIVE DATAHUB READBACK VERIFIED
+  search_documents: exact generated URN and title found
+  grep_documents: incident ID and external receipt ID found in content
+  get_entities: dataset and DataJob both linked the saved document
+
+Related assets
+  urn:li:dataset:(urn:li:dataPlatform:postgres,aftershock_demo.inventory_pricing,DEV)
+  urn:li:dataJob:(urn:li:dataFlow:(airflow,aftershock_demo,DEV),purchase_order_generator)
+
+No credential or bearer token is included in this transcript.

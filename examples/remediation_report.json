@@ -35,7 +35,7 @@
   ],
   "timestamp": "2026-08-04T12:00:00Z",
   "writeback": {
-    "document_urn": "urn:li:document:aftershock-incident-inc-9942-340f1a234b21d12d2e9c81ae4a2f0c13",
+    "document_urn": "urn:li:document:aftershock-fixture",
     "error": null,
     "status": "succeeded"
   }

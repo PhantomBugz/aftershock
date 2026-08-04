@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import unicodedata
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -27,7 +28,7 @@ class BlastRadiusMapper:
         )
 
     async def get_targets(self, dataset_urn: str) -> list[ActionableTarget]:
-        """Return every identifiable downstream node in lineage order.
+        """Return every unique identifiable downstream node in lineage order.
 
         Detail lookup is intentionally batched and joined by URN because the MCP
         response order is not part of the mapper's contract. Nodes without a
@@ -100,6 +101,7 @@ def _lineage_entities(payload: Mapping[str, Any]) -> list[dict[str, str]]:
         raise BlastRadiusMappingError("DataHub lineage searchResults is malformed")
 
     entities: list[dict[str, str]] = []
+    seen_urns: set[str] = set()
     for index, result in enumerate(search_results):
         if not isinstance(result, Mapping):
             raise BlastRadiusMappingError(
@@ -115,6 +117,9 @@ def _lineage_entities(payload: Mapping[str, Any]) -> list[dict[str, str]]:
             raise BlastRadiusMappingError(
                 f"DataHub lineage result {index} has no valid URN"
             )
+        if urn in seen_urns:
+            continue
+        seen_urns.add(urn)
         entity_type = entity.get("type")
         entities.append(
             {
@@ -184,6 +189,7 @@ def _structured_string(
     ):
         return None
 
+    matching_properties: list[Mapping[str, Any]] = []
     for property_value in properties:
         if not isinstance(property_value, Mapping):
             continue
@@ -195,13 +201,29 @@ def _structured_string(
             continue
         if definition.get("qualifiedName") != qualified_name:
             continue
-        values = property_value.get("values")
-        if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
-            continue
-        for value in values:
-            if not isinstance(value, Mapping):
-                continue
-            string_value = value.get("stringValue")
-            if isinstance(string_value, str) and string_value.strip():
-                return string_value.strip()
-    return None
+        matching_properties.append(property_value)
+
+    if len(matching_properties) != 1:
+        return None
+    values = matching_properties[0].get("values")
+    if (
+        not isinstance(values, Sequence)
+        or isinstance(values, (str, bytes))
+        or len(values) != 1
+    ):
+        return None
+    value = values[0]
+    if not isinstance(value, Mapping):
+        return None
+    string_value = value.get("stringValue")
+    if (
+        not isinstance(string_value, str)
+        or not string_value
+        or string_value != string_value.strip()
+        or any(
+            unicodedata.category(character).startswith("C")
+            for character in string_value
+        )
+    ):
+        return None
+    return string_value

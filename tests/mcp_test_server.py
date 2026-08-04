@@ -19,6 +19,7 @@ DATA_JOB_URN = (
 MODEL_URN = (
     "urn:li:mlModel:(urn:li:dataPlatform:sagemaker,dynamic_pricing_model,PROD)"
 )
+DOCUMENT_URN = "urn:li:document:aftershock-inc-9942"
 
 
 @dataclass
@@ -49,15 +50,48 @@ class MCPCallRecorder:
     save_payload: dict[str, Any] = field(
         default_factory=lambda: {
             "success": True,
-            "urn": "urn:li:document:aftershock-inc-9942",
+            "urn": DOCUMENT_URN,
             "message": "saved",
             "author": "urn:li:corpuser:test",
+        }
+    )
+    search_payload: dict[str, Any] | list[Any] = field(
+        default_factory=lambda: {
+            "start": 0,
+            "count": 10,
+            "total": 1,
+            "searchResults": [
+                {
+                    "entity": {
+                        "urn": DOCUMENT_URN,
+                        "subType": "Summary",
+                        "info": {"title": "Aftershock incident INC-9942"},
+                    }
+                }
+            ],
+        }
+    )
+    grep_payload: dict[str, Any] | list[Any] = field(
+        default_factory=lambda: {
+            "results": [
+                {
+                    "urn": DOCUMENT_URN,
+                    "title": "Aftershock incident INC-9942",
+                    "matches": [
+                        {"excerpt": "marker: AFTERSHOCK-UNIQUE", "position": 8}
+                    ],
+                    "total_matches": 1,
+                }
+            ],
+            "total_matches": 1,
+            "documents_with_matches": 1,
         }
     )
     echo_saved_urn: bool = False
     fail_tool: str | None = None
     failure_message: str = "server failure containing super-secret-value"
     max_lineage_calls: int | None = None
+    datahub_060_lineage_results: list[dict[str, Any]] | None = None
 
 
 def build_test_server(recorder: MCPCallRecorder) -> FastMCP:
@@ -92,6 +126,21 @@ def build_test_server(recorder: MCPCallRecorder) -> FastMCP:
             and lineage_call_count > recorder.max_lineage_calls
         ):
             raise RuntimeError("lineage pagination did not advance")
+        if recorder.datahub_060_lineage_results is not None:
+            # mcp-server-datahub 0.6.0 fetches only ``max_results`` from
+            # GraphQL starting at zero, then applies the requested offset.
+            all_results = recorder.datahub_060_lineage_results
+            fetched_results = all_results[:max_results]
+            page_results = fetched_results[offset:]
+            return {
+                "downstreams": {
+                    "searchResults": page_results,
+                    "total": len(all_results),
+                    "offset": offset,
+                    "returned": len(page_results),
+                    "hasMore": offset + len(page_results) < len(fetched_results),
+                }
+            }
         return recorder.lineage_pages[offset]
 
     @server.tool
@@ -106,12 +155,50 @@ def build_test_server(recorder: MCPCallRecorder) -> FastMCP:
         return recorder.entities_payload
 
     @server.tool
+    async def search_documents(
+        query: str,
+        num_results: int,
+        offset: int,
+    ) -> dict[str, Any] | list[Any]:
+        arguments = {
+            "query": query,
+            "num_results": num_results,
+            "offset": offset,
+        }
+        recorder.calls.append(("search_documents", arguments))
+        recorder.events.append("search_documents")
+        if recorder.fail_tool == "search_documents":
+            raise RuntimeError(recorder.failure_message)
+        return recorder.search_payload
+
+    @server.tool
+    async def grep_documents(
+        urns: list[str],
+        pattern: str,
+        context_chars: int,
+        max_matches_per_doc: int,
+        start_offset: int,
+    ) -> dict[str, Any] | list[Any]:
+        arguments = {
+            "urns": list(urns),
+            "pattern": pattern,
+            "context_chars": context_chars,
+            "max_matches_per_doc": max_matches_per_doc,
+            "start_offset": start_offset,
+        }
+        recorder.calls.append(("grep_documents", arguments))
+        recorder.events.append("grep_documents")
+        if recorder.fail_tool == "grep_documents":
+            raise RuntimeError(recorder.failure_message)
+        return recorder.grep_payload
+
+    @server.tool
     async def save_document(
         document_type: str,
         title: str,
         content: str,
-        urn: str | None,
         related_assets: list[str],
+        urn: str | None = None,
     ) -> dict[str, Any]:
         arguments = {
             "document_type": document_type,
@@ -124,7 +211,7 @@ def build_test_server(recorder: MCPCallRecorder) -> FastMCP:
         recorder.events.append("save_document")
         if recorder.fail_tool == "save_document":
             raise RuntimeError(recorder.failure_message)
-        if recorder.echo_saved_urn:
+        if recorder.echo_saved_urn and urn is not None:
             return {**recorder.save_payload, "urn": urn}
         return recorder.save_payload
 
