@@ -6,7 +6,7 @@
 
 **Architecture:** A `DataHubContextPort` separates live MCP transport from fixtures. `BlastRadiusMapper` normalizes lineage plus structured properties, `CompensatingActionEngine` returns immutable receipts, and `AftershockIncidentProcessor` coordinates discovery, remediation, and one incident-document write-back. The FastAPI listener and Rich dashboard consume the same processor.
 
-**Tech Stack:** Python 3.12, official `mcp` Python SDK 1.x, official `mcp-server-datahub` 0.6.0, DataHub 1.6, FastAPI, httpx, Rich, pytest
+**Tech Stack:** Python 3.12, FastMCP 3.4.5 (the official DataHub server's MCP stack), official `mcp-server-datahub` 0.6.0, DataHub 1.6, FastAPI, httpx, Rich, pytest
 
 ---
 
@@ -36,7 +36,7 @@
 
 - [ ] **Step 1: Add the failing MCP protocol test**
 
-Create an in-process `mcp.server.fastmcp.FastMCP` server with tools named `get_lineage`, `get_entities`, and `save_document`. Use `mcp.shared.memory.create_connected_server_and_client_session` so the official client performs MCP initialization and `tools/call` exchanges. Assert that `MCPDataHubContext.get_lineage()` calls:
+Create an in-process `fastmcp.FastMCP` server with tools named `get_lineage`, `get_entities`, and `save_document`. Connect with `fastmcp.Client(FastMCPTransport(server, raise_exceptions=True))` so the same stack used by the official DataHub server performs MCP initialization and `tools/call` exchanges. Assert that `MCPDataHubContext.get_lineage()` calls:
 
 ```python
 {
@@ -60,20 +60,20 @@ Expected: collection fails because `datahub_context` does not exist.
 Add both dependency ranges to `pyproject.toml` and `requirements.txt`:
 
 ```text
-mcp>=1.27.1,<2
 mcp-server-datahub==0.6.0
+fastmcp==3.4.5
 ```
 
 Install with `python -m pip install -r requirements.txt`.
 
 - [ ] **Step 4: Implement the minimum MCP adapter**
 
-Implement a `DataHubContextPort` protocol and `MCPDataHubContext`. Its injected `session_factory` yields an initialized `mcp.ClientSession`. `_call_tool()` must reject `isError`, prefer `structuredContent`, and JSON-decode a single text content block as a fallback.
+Implement a `DataHubContextPort` protocol and `MCPDataHubContext`. Its injected `client_factory` returns a `fastmcp.Client`. `_call_tool()` must reject `is_error`, prefer `data`, then `structured_content`, and JSON-decode a single text content block as a fallback.
 
 Production session factories must support:
 
 ```python
-StdioServerParameters(
+StdioTransport(
     command=sys.executable,
     args=["-m", "mcp_server_datahub"],
     env={
@@ -83,7 +83,7 @@ StdioServerParameters(
 )
 ```
 
-and `streamable_http_client(DATAHUB_MCP_URL, http_client=authenticated_client)`. The remote MCP client uses only `DATAHUB_MCP_TOKEN`; it must never forward `DATAHUB_GMS_TOKEN` to an arbitrary MCP URL.
+and `StreamableHttpTransport(url=DATAHUB_MCP_URL, headers=authenticated_headers)`. The remote MCP client uses only `DATAHUB_MCP_TOKEN`; it must never forward `DATAHUB_GMS_TOKEN` to an arbitrary MCP URL.
 
 Add `FixtureDataHubContext` with `mode="fixture"`; add `build_datahub_context_from_env()` accepting only `fixture` and `mcp`. Never catch a live MCP error and return the fixture.
 

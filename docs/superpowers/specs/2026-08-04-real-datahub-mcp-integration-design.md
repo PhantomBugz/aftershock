@@ -115,7 +115,7 @@ Write-back failure is reported separately from remediation failure. A successful
 
 ## Testing Strategy
 
-Tests use a real in-process MCP transport from the official Python MCP/FastMCP stack. The test server records tool names and JSON arguments while returning deterministic DataHub-shaped payloads. This verifies MCP initialization and `tools/call` behavior without claiming that Docker or a live DataHub instance was used.
+Tests use a real in-process MCP transport from the same FastMCP 3.x stack used by the official DataHub MCP Server. The test server records tool names and JSON arguments while returning deterministic DataHub-shaped payloads. This verifies MCP initialization and `tools/call` behavior without claiming that Docker or a live DataHub instance was used.
 
 TDD cycles cover:
 
