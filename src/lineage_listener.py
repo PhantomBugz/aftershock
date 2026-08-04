@@ -59,12 +59,14 @@ async def receive_datahub_incident(
             "message": "no action required",
         }
 
-    targets = await mapper.get_actionable_targets(incident.dataset_urn)
-    results = await engine.process_blast_radius(targets, incident.incident_id)
+    targets = await mapper.get_targets(incident.dataset_urn)
+    receipts = await engine.process_blast_radius(targets, incident.incident_id)
     return {
         "status": "accepted",
         "incident_id": incident.incident_id,
         "targets_found": len(targets),
-        "remediations_triggered": sum(results),
-        "results": results,
+        "remediations_triggered": sum(
+            receipt.status == "succeeded" for receipt in receipts
+        ),
+        "results": [receipt.to_dict() for receipt in receipts],
     }

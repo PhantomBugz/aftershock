@@ -53,7 +53,34 @@ def test_critical_incident_triggers_downstream_remediations(monkeypatch) -> None
         "incident_id": "INC-9942",
         "targets_found": 2,
         "remediations_triggered": 2,
-        "results": [True, True],
+        "results": [
+            {
+                "incident_id": "INC-9942",
+                "target_urn": (
+                    "urn:li:dataJob:(urn:li:dataFlow:(airflow,aftershock_demo,PROD),"
+                    "purchase_order_generator)"
+                ),
+                "entity_type": "DATA_JOB",
+                "business_action": "ISSUE_PO",
+                "endpoint": "https://api.internal.example/remediate/cancel_po",
+                "status": "succeeded",
+                "http_status": 200,
+                "error": None,
+            },
+            {
+                "incident_id": "INC-9942",
+                "target_urn": (
+                    "urn:li:mlModel:(urn:li:dataPlatform:sagemaker,"
+                    "dynamic_pricing_model,PROD)"
+                ),
+                "entity_type": "ML_MODEL",
+                "business_action": "ADJUST_PRICE",
+                "endpoint": "https://api.internal.example/remediate/revert_pricing",
+                "status": "succeeded",
+                "http_status": 200,
+                "error": None,
+            },
+        ],
     }
     assert {request.url.path for request in requests} == {
         "/remediate/cancel_po",

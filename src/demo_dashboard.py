@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping, Sequence
-from typing import Any
+from collections.abc import Sequence
 
 import httpx
 from rich.console import Console
@@ -15,6 +14,7 @@ from rich.tree import Tree
 from blast_radius_mapper import BlastRadiusMapper
 from compensating_action_engine import CompensatingActionEngine
 from datahub_context import FixtureDataHubContext
+from remediation_models import ActionableTarget, RemediationReceipt
 
 
 DEMO_DATASET_URN = (
@@ -24,7 +24,7 @@ DEMO_INCIDENT_ID = "INC-9942"
 
 
 def _build_blast_radius_tree(
-    downstream_entities: Sequence[Mapping[str, Any]],
+    targets: Sequence[ActionableTarget],
 ) -> Tree:
     tree = Tree(
         "[bold red]inventory_pricing[/] [red](CORRUPTED SOURCE)[/]",
@@ -35,20 +35,12 @@ def _build_blast_radius_tree(
         "DATA_JOB": ("Airflow Job", "purchase_order_generator"),
         "ML_MODEL": ("SageMaker Model", "dynamic_pricing_model"),
     }
-    for wrapped_entity in downstream_entities:
-        entity = wrapped_entity.get("entity", {})
-        if not isinstance(entity, Mapping):
-            continue
-        entity_type = str(entity.get("type", "UNKNOWN"))
+    for target in targets:
+        entity_type = target.entity_type
         system_label, fallback_name = labels.get(
             entity_type, (entity_type.replace("_", " ").title(), "downstream_system")
         )
-        custom_properties = entity.get("customProperties", {})
-        action = (
-            custom_properties.get("business_action", "UNDEFINED")
-            if isinstance(custom_properties, Mapping)
-            else "UNDEFINED"
-        )
+        action = target.business_action or "UNDEFINED"
         tree.add(
             f"[bold yellow]{system_label}[/] [white]{fallback_name}[/]\n"
             f"[dim]Action:[/] [bold bright_magenta]{action}[/]"
@@ -62,12 +54,12 @@ async def run_demo(
     console: Console | None = None,
     http_client: httpx.AsyncClient | None = None,
     delay: float = 1.5,
-) -> list[bool]:
+) -> list[RemediationReceipt]:
     """Render four acts while executing the real compensating-action engine."""
 
     active_console = console or Console()
     mapper = BlastRadiusMapper(FixtureDataHubContext())
-    downstream_entities = await mapper.get_actionable_targets(DEMO_DATASET_URN)
+    targets = await mapper.get_targets(DEMO_DATASET_URN)
 
     active_console.print(
         Panel.fit(
@@ -84,7 +76,7 @@ async def run_demo(
 
     active_console.print(
         Panel(
-            _build_blast_radius_tree(downstream_entities),
+            _build_blast_radius_tree(targets),
             title="[bold yellow]ACT 2  //  BLAST RADIUS[/]",
             subtitle="[dim]DataHub downstream lineage resolved[/]",
             border_style="yellow",
@@ -93,7 +85,9 @@ async def run_demo(
     )
     await asyncio.sleep(delay)
 
-    async def execute_controls(client: httpx.AsyncClient) -> list[bool]:
+    async def execute_controls(
+        client: httpx.AsyncClient,
+    ) -> list[RemediationReceipt]:
         engine = CompensatingActionEngine(http_client=client)
         with Progress(
             SpinnerColumn(style="bold bright_cyan"),
@@ -106,7 +100,7 @@ async def run_demo(
                 "Executing Compensating Controls...", total=1
             )
             results = await engine.process_blast_radius(
-                downstream_entities, incident_id=DEMO_INCIDENT_ID
+                targets, incident_id=DEMO_INCIDENT_ID
             )
             progress.update(task_id, completed=1)
         return results

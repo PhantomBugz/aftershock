@@ -6,6 +6,7 @@ import httpx
 from rich.console import Console
 
 from demo_dashboard import run_demo
+from remediation_models import RemediationReceipt
 
 
 def test_dashboard_renders_lifecycle_and_executes_engine() -> None:
@@ -16,7 +17,7 @@ def test_dashboard_renders_lifecycle_and_executes_engine() -> None:
         requests.append((request.url.path, json.loads(request.content)))
         return httpx.Response(200, json={"status": "accepted"})
 
-    async def scenario() -> list[bool]:
+    async def scenario() -> list[RemediationReceipt]:
         transport = httpx.MockTransport(remediation_api)
         async with httpx.AsyncClient(transport=transport) as client:
             console = Console(
@@ -30,7 +31,7 @@ def test_dashboard_renders_lifecycle_and_executes_engine() -> None:
     results = asyncio.run(scenario())
     rendered = output.getvalue()
 
-    assert results == [True, True]
+    assert [receipt.status for receipt in results] == ["succeeded", "succeeded"]
     assert "CRITICAL INCIDENT DETECTED" in rendered
     assert "Pricing Decimal Shift" in rendered
     assert "inventory_pricing" in rendered
