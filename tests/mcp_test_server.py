@@ -26,6 +26,7 @@ class MCPCallRecorder:
     """Mutable server state and an exact record of received tool arguments."""
 
     calls: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
+    events: list[str] = field(default_factory=list)
     lineage_pages: dict[int, dict[str, Any]] = field(
         default_factory=lambda: {
             0: {
@@ -79,6 +80,7 @@ def build_test_server(recorder: MCPCallRecorder) -> FastMCP:
             "offset": offset,
         }
         recorder.calls.append(("get_lineage", arguments))
+        recorder.events.append("get_lineage")
         if recorder.fail_tool == "get_lineage":
             raise RuntimeError(recorder.failure_message)
         lineage_call_count = sum(
@@ -97,6 +99,7 @@ def build_test_server(recorder: MCPCallRecorder) -> FastMCP:
     ) -> list[dict[str, Any]] | dict[str, Any]:
         arguments = {"urns": list(urns)}
         recorder.calls.append(("get_entities", arguments))
+        recorder.events.append("get_entities")
         if recorder.fail_tool == "get_entities":
             raise RuntimeError(recorder.failure_message)
         return recorder.entities_payload
@@ -117,6 +120,7 @@ def build_test_server(recorder: MCPCallRecorder) -> FastMCP:
             "related_assets": list(related_assets),
         }
         recorder.calls.append(("save_document", arguments))
+        recorder.events.append("save_document")
         if recorder.fail_tool == "save_document":
             raise RuntimeError(recorder.failure_message)
         return recorder.save_payload
