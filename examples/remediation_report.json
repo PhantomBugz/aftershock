@@ -1,7 +1,9 @@
 {
   "context_mode": "fixture",
   "counts": {
+    "accepted": 0,
     "failed": 0,
+    "outcome_unknown": 0,
     "skipped": 0,
     "succeeded": 2
   },
@@ -13,6 +15,7 @@
       "endpoint": "https://api.internal.example/remediate/cancel_po",
       "entity_type": "DATA_JOB",
       "error": null,
+      "external_receipt_id": "fixture-receipt-cancel_po",
       "http_status": 200,
       "incident_id": "INC-9942",
       "status": "succeeded",
@@ -23,6 +26,7 @@
       "endpoint": "https://api.internal.example/remediate/revert_pricing",
       "entity_type": "ML_MODEL",
       "error": null,
+      "external_receipt_id": "fixture-receipt-revert_pricing",
       "http_status": 200,
       "incident_id": "INC-9942",
       "status": "succeeded",
