@@ -1,363 +1,221 @@
 # Real DataHub MCP Integration Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+**Status:** Implemented in an isolated feature branch; reconciled with the
+governed receipt, allowlist, deadline, and safe-bootstrap contracts. Public
+submission steps remain separate human work.
 
-**Goal:** Make Aftershock perform genuine DataHub MCP lineage reads and `save_document` write-back, with structured remediation receipts and explicitly labeled offline fixtures.
+## Objective
 
-**Architecture:** A `DataHubContextPort` separates live MCP transport from fixtures. `BlastRadiusMapper` normalizes lineage plus structured properties, `CompensatingActionEngine` returns immutable receipts, and `AftershockIncidentProcessor` coordinates discovery, remediation, and one incident-document write-back. The FastAPI listener and Rich dashboard consume the same processor.
-
-**Tech Stack:** Python 3.12, FastMCP 3.4.5 (the official DataHub server's MCP stack), official `mcp-server-datahub` 0.6.0, DataHub 1.6, FastAPI, httpx, Rich, pytest
-
----
-
-## File Structure
-
-- Create `src/datahub_context.py`: MCP session transport, tool-result parsing, live/fixture adapters, and environment factory.
-- Create `src/remediation_models.py`: actionable-target, remediation-receipt, write-back, and incident-report dataclasses.
-- Create `src/incident_processor.py`: end-to-end incident orchestration and document rendering.
-- Replace `src/blast_radius_mapper.py`: normalize MCP lineage and DataHub structured properties.
-- Modify `src/compensating_action_engine.py`: return structured receipts.
-- Modify `src/lineage_listener.py`: use the processor and return honest structured status.
-- Modify `src/demo_dashboard.py`: explicit fixture mode and receipt-driven output.
-- Create `scripts/bootstrap_datahub_demo.py`: seed demo assets and structured-property values after definitions exist.
-- Create `config/aftershock_structured_properties.yaml`: DataHub CLI property definitions.
-- Create `tests/mcp_test_server.py`: in-process official MCP server fixture.
-- Add focused tests for each component plus an opt-in live integration test.
-- Update `README.md`, `docs/devpost-pitch.md`, `docs/video-script.md`; add live setup, RFC, feedback draft, and `examples/` artifacts.
-
-### Task 1: Official MCP client and explicit context modes
-
-**Files:**
-- Modify: `pyproject.toml`
-- Modify: `requirements.txt`
-- Create: `src/datahub_context.py`
-- Create: `tests/mcp_test_server.py`
-- Create: `tests/test_datahub_context.py`
-
-- [ ] **Step 1: Add the failing MCP protocol test**
-
-Create an in-process `fastmcp.FastMCP` server with tools named `get_lineage`, `get_entities`, and `save_document`. Connect with `fastmcp.Client(FastMCPTransport(server, raise_exceptions=True))` so the same stack used by the official DataHub server performs MCP initialization and `tools/call` exchanges. Assert that `MCPDataHubContext.get_lineage()` calls:
-
-```python
-{
-    "urn": DATASET_URN,
-    "upstream": False,
-    "max_hops": 3,
-    "max_results": 100,
-}
-```
-
-Assert that `save_document()` calls `document_type="Summary"`, passes the deterministic document URN, and includes all `related_assets`.
-
-- [ ] **Step 2: Run the focused test and verify RED**
-
-Run: `python -m pytest tests/test_datahub_context.py -q`
-
-Expected: collection fails because `datahub_context` does not exist.
-
-- [ ] **Step 3: Add the official dependencies**
-
-Add both dependency ranges to `pyproject.toml` and `requirements.txt`:
+Build Aftershock as a deterministic DataHub agent loop for **Agents That Do
+Real Work**:
 
 ```text
-mcp-server-datahub==0.6.0
-fastmcp==3.4.5
+observe DataHub -> decide from metadata and policy -> act -> save evidence
 ```
 
-Install with `python -m pip install -r requirements.txt`.
+The system must not infer business success from HTTP transport, silently change
+from live MCP to fixtures, or present fixture/protocol tests as a live DataHub
+run.
 
-- [ ] **Step 4: Implement the minimum MCP adapter**
+## Pinned stack
 
-Implement a `DataHubContextPort` protocol and `MCPDataHubContext`. Its injected `client_factory` returns a `fastmcp.Client`. `_call_tool()` must reject `is_error`, prefer `data`, then `structured_content`, and JSON-decode a single text content block as a fallback.
+- Python 3.12
+- `mcp-server-datahub==0.6.0`
+- `fastmcp==3.4.5`
+- `acryl-datahub==1.6.0.17`
+- FastAPI, HTTPX, Rich, and pytest
 
-Production session factories must support:
+## Task 1 — MCP context and explicit modes
 
-```python
-StdioTransport(
-    command=sys.executable,
-    args=["-m", "mcp_server_datahub"],
-    env={
-        **safe_environment,
-        "TOOLS_IS_MUTATION_ENABLED": "true",
-    },
-)
-```
+**Files:** `src/datahub_context.py`, `tests/mcp_test_server.py`,
+`tests/test_datahub_context.py`, dependency manifests.
 
-and `StreamableHttpTransport(url=DATAHUB_MCP_URL, headers=authenticated_headers)`. The remote MCP client uses only `DATAHUB_MCP_TOKEN`; it must never forward `DATAHUB_GMS_TOKEN` to an arbitrary MCP URL.
+- [x] Implement a `DataHubContextPort` with MCP and fixture adapters.
+- [x] Use genuine FastMCP initialization and `tools/call` exchanges in protocol
+  tests.
+- [x] Support stdio MCP with explicit GMS configuration and remote Streamable
+  HTTP MCP with a separate MCP token.
+- [x] Parse DataHub tool results from decoded data, structured content, or one
+  JSON text block; reject errors and ambiguous shapes with secret-safe output.
+- [x] Make `AFTERSHOCK_DATAHUB_MODE` accept only `mcp` or `fixture` and never
+  change modes after a live failure.
+- [x] Paginate `get_lineage` fail-closed with offset/total/continuation and
+  repeated-page validation.
 
-Add `FixtureDataHubContext` with `mode="fixture"`; add `build_datahub_context_from_env()` accepting only `fixture` and `mcp`. Never catch a live MCP error and return the fixture.
+The adapter sends `upstream=false`, `max_results=100`, and `max_hops=3`. For
+the pinned server, `max_hops=3` means unlimited traversal. Tests and documents
+must not describe it as a finite hop limit.
 
-- [ ] **Step 5: Run the focused test and verify GREEN**
+## Task 2 — Typed blast-radius mapping
 
-Run: `python -m pytest tests/test_datahub_context.py -q`
+**Files:** `src/remediation_models.py`, `src/blast_radius_mapper.py`,
+`mock-data/datahub_lineage.json`, mapper tests.
 
-Expected: MCP protocol and mode tests pass.
+- [x] Discover downstream URNs through `get_lineage`.
+- [x] Fetch unique entity details in one `get_entities` batch.
+- [x] Read `aftershock.businessAction` and
+  `aftershock.remediationWebhook` by exact qualified name.
+- [x] Preserve lineage order and ambiguous/missing targets rather than
+  selecting an arbitrary response.
+- [x] Make missing playbook data produce a later `skipped` receipt.
+- [x] Label the synthetic fixture, including its MLModel example, as offline
+  data rather than evidence of a live lineage run.
 
-- [ ] **Step 6: Commit**
+## Task 3 — Governed outbound execution
 
-```powershell
-git add pyproject.toml requirements.txt src/datahub_context.py tests/mcp_test_server.py tests/test_datahub_context.py
-git commit -m "feat: add genuine DataHub MCP context adapter"
-```
+**Files:** `src/compensating_action_engine.py`, `src/remediation_models.py`,
+engine tests.
 
-### Task 2: MCP blast-radius mapping and structured playbook properties
+- [x] Require a nonempty exact URL policy from
+  `AFTERSHOCK_REMEDIATION_ALLOWLIST_JSON` in listener sessions.
+- [x] Authorize scheme/host/port/path/query exactly; do not prefix-match.
+- [x] Reject user information, fragments, whitespace, and controls.
+- [x] Allow plain HTTP only for loopback; require HTTPS for nonloopback.
+- [x] Disable redirects at dispatch.
+- [x] Strip user/query/fragment information from logs and persisted endpoints.
+- [x] Preserve operator responsibility for DataHub RBAC, receiver
+  authentication, and infrastructure egress controls.
+- [x] Never instruct operators to store credentials in metadata or URLs.
 
-**Files:**
-- Create: `src/remediation_models.py`
-- Replace: `src/blast_radius_mapper.py`
-- Replace: `tests/test_blast_radius_mapper.py`
-- Modify: `mock-data/datahub_lineage.json`
+## Task 4 — Five-state terminal receipt contract
 
-- [ ] **Step 1: Write failing mapper tests**
+**Files:** engine, shared models, processor, listener, dashboard, and their
+focused tests.
 
-Make the MCP test server return `downstreams.searchResults[].entity` from `get_lineage` and detailed entities from `get_entities`. Use this exact structured-property shape:
+- [x] Add `external_receipt_id` and statuses `succeeded`, `accepted`, `failed`,
+  `skipped`, and `outcome_unknown`.
+- [x] Classify `succeeded` only for an eligible non-202 response with the v1
+  terminal contract; 408/5xx are eligible only when that contract is present:
 
-```python
-"structuredProperties": {
-    "properties": [
-        {
-            "structuredProperty": {
-                "urn": "urn:li:structuredProperty:aftershock.businessAction",
-                "definition": {"qualifiedName": "aftershock.businessAction"},
-            },
-            "values": [{"stringValue": "ISSUE_PO"}],
-        },
-        {
-            "structuredProperty": {
-                "urn": "urn:li:structuredProperty:aftershock.remediationWebhook",
-                "definition": {"qualifiedName": "aftershock.remediationWebhook"},
-            },
-            "values": [
-                {"stringValue": "https://api.internal.example/remediate/cancel_po"}
-            ],
-        },
-    ]
+```json
+{
+  "receipt_version": 1,
+  "status": "succeeded",
+  "receipt_id": "receiver-generated-stable-id"
 }
 ```
 
-Assert `ActionableTarget` values and verify an entity missing a playbook remains present with missing fields so the engine can issue a skipped receipt.
+- [x] Treat HTTP 202 and v1 accepted/pending as nonterminal `accepted`.
+- [x] Treat 4xx other than 408, disabled redirect, pre-dispatch failure, or a
+  valid v1 terminal failure as `failed`.
+- [x] Treat 408/5xx without a valid v1 terminal success/failure receipt,
+  post-dispatch transport error, deadline expiry after dispatch, or
+  missing/invalid terminal response as `outcome_unknown`.
+- [x] Treat policy denial, missing playbook data, and deadline expiry before
+  dispatch as `skipped`.
+- [x] Preserve observed HTTP status and valid external receipt ID without
+  recording arbitrary response content.
+- [x] Include a deterministic `Idempotency-Key` while stating that it is not
+  proof of exactly-once execution.
 
-- [ ] **Step 2: Run the mapper test and verify RED**
+## Task 5 — Bounded processor and write-back
 
-Run: `python -m pytest tests/test_blast_radius_mapper.py -q`
+**Files:** `src/incident_processor.py`, processor tests.
 
-Expected: imports or assertions fail because the typed MCP mapper is absent.
+- [x] Bound engine workers (default eight) and the control-phase deadline
+  (default 30 seconds), preserving input order.
+- [x] Cancel/clean workers on deadline while classifying dispatched vs
+  undispatched targets conservatively.
+- [x] Render incident Markdown containing all receipt fields, including the
+  external receipt ID.
+- [x] Call `save_document` exactly once after controls settle with a
+  deterministic source/incident-derived document URN.
+- [x] Include unique source/target URNs in `related_assets`.
+- [x] Keep write-back failure separate from already observed control states.
+- [x] Define overall `completed` as all receipts terminal `succeeded` plus a
+  successful DataHub write-back. Every other combination is
+  `completed_with_issues`.
 
-- [ ] **Step 3: Implement models and mapper**
+## Task 6 — Authenticated ingress and truthful presentation
 
-Create frozen dataclasses with `to_dict()` methods:
+**Files:** `src/lineage_listener.py`, `src/demo_dashboard.py`, API/dashboard
+tests.
 
-```python
-@dataclass(frozen=True)
-class ActionableTarget:
-    urn: str
-    entity_type: str
-    business_action: str | None
-    remediation_webhook: str | None
+- [x] Accept an Aftershock-normalized envelope and require bearer
+  `AFTERSHOCK_WEBHOOK_TOKEN` for critical input.
+- [x] Ignore noncritical input before authentication, allowlist parsing, or
+  context construction.
+- [x] Return fixed, secret-safe errors for auth/config/MCP/mapping failures.
+- [x] Return counts for all five receipt states and include external IDs.
+- [x] Display the same receipt and completion semantics in Rich.
+- [x] Mark the default presentation `OFFLINE FIXTURE MODE`.
+- [x] Make fixture endpoints exactly allowlisted and return deterministic v1
+  terminal test receipts through `httpx.MockTransport`.
+
+Production ingress remains:
+
+```text
+incidentInfo MetadataChangeLogEvent
+  -> custom DataHub Action adapter
+  -> authenticated normalized POST
+  -> Aftershock
 ```
 
-`BlastRadiusMapper.get_targets()` calls the context port for downstream lineage, batches all URNs into one `get_entities` call, then extracts properties by `definition.qualifiedName`. Preserve lineage order and never use the removed GraphQL route.
-
-Update the fixture to use the same `structuredProperties` representation returned by MCP.
-
-- [ ] **Step 4: Run focused and regression tests**
-
-Run: `python -m pytest tests/test_blast_radius_mapper.py tests/test_datahub_context.py -q`
-
-Expected: all focused tests pass.
-
-- [ ] **Step 5: Commit**
-
-```powershell
-git add src/remediation_models.py src/blast_radius_mapper.py tests/test_blast_radius_mapper.py mock-data/datahub_lineage.json
-git commit -m "feat: map DataHub structured playbooks from MCP lineage"
-```
-
-### Task 3: Structured compensating-control receipts
-
-**Files:**
-- Modify: `src/remediation_models.py`
-- Replace: `src/compensating_action_engine.py`
-- Replace: `tests/test_compensating_action_engine.py`
-
-- [ ] **Step 1: Write failing receipt tests**
-
-Test one HTTP 200 target, one HTTP 503 target, and one target without a webhook. Assert `RemediationReceipt.status` equals `succeeded`, `failed`, and `skipped`; assert HTTP status/error fields and the request body’s `business_action`.
-
-- [ ] **Step 2: Run the engine test and verify RED**
-
-Run: `python -m pytest tests/test_compensating_action_engine.py -q`
-
-Expected: old `list[bool]` output does not satisfy receipt assertions.
-
-- [ ] **Step 3: Implement receipt-based execution**
-
-`execute_rollback()` must catch HTTP errors per target and return a receipt without cancelling sibling tasks. `process_blast_radius()` must use `asyncio.gather` and preserve input order. Redact URL user-info/query/fragment in stored receipts.
-
-- [ ] **Step 4: Run the focused test and verify GREEN**
-
-Run: `python -m pytest tests/test_compensating_action_engine.py -q`
-
-Expected: receipt tests pass.
-
-- [ ] **Step 5: Commit**
-
-```powershell
-git add src/remediation_models.py src/compensating_action_engine.py tests/test_compensating_action_engine.py
-git commit -m "feat: emit structured remediation receipts"
-```
-
-### Task 4: Incident processor and real `save_document` write-back
-
-**Files:**
-- Create: `src/incident_processor.py`
-- Create: `tests/test_incident_processor.py`
-- Modify: `src/remediation_models.py`
-
-- [ ] **Step 1: Write failing end-to-end processor tests**
-
-Use the real in-process MCP server and `httpx.MockTransport`. Assert order:
-
-1. `get_lineage`;
-2. `get_entities`;
-3. remediation HTTP calls;
-4. `save_document`.
-
-Assert the document Markdown includes every receipt, the execution mode, and the source dataset. Assert `related_assets` contains the source and all targets. Add a write-back-error test proving successful control receipts remain successful while `writeback.status="failed"`.
-
-- [ ] **Step 2: Run processor tests and verify RED**
-
-Run: `python -m pytest tests/test_incident_processor.py -q`
-
-Expected: `incident_processor` does not exist.
-
-- [ ] **Step 3: Implement the coordinator**
-
-Create `AftershockIncidentProcessor.process(incident_id, dataset_urn) -> IncidentReport`. Derive a safe deterministic URN such as `urn:li:document:aftershock-inc-9942`; render Markdown without claims beyond the receipts; call `save_document` with `document_type="Summary"` and no unseeded topic tags.
-
-- [ ] **Step 4: Run processor and full tests**
-
-Run: `python -m pytest tests/test_incident_processor.py -q`
-
-Expected: all processor tests pass.
-
-- [ ] **Step 5: Commit**
-
-```powershell
-git add src/incident_processor.py src/remediation_models.py tests/test_incident_processor.py
-git commit -m "feat: persist remediation summaries through DataHub MCP"
-```
-
-### Task 5: Listener and truthful Rich demo
-
-**Files:**
-- Replace: `src/lineage_listener.py`
-- Replace: `src/demo_dashboard.py`
-- Replace: `tests/test_lineage_listener.py`
-- Replace: `tests/test_demo_dashboard.py`
-
-- [ ] **Step 1: Write failing API and dashboard tests**
-
-The API test must assert `context_mode`, counts by receipt status, and write-back URN/status. The dashboard test must assert `OFFLINE FIXTURE MODE`, `get_lineage(upstream=false)`, individual receipt statuses, and the saved document URN. Assert the output does not contain `$120,000`, `transactions reversed`, or `Enterprise State Restored`.
-
-- [ ] **Step 2: Run UI tests and verify RED**
-
-Run: `python -m pytest tests/test_lineage_listener.py tests/test_demo_dashboard.py -q`
-
-Expected: old Boolean response and marketing text fail assertions.
-
-- [ ] **Step 3: Wire the processor into FastAPI and Rich**
-
-Use FastAPI dependency injection for `AftershockIncidentProcessor`. Keep the request envelope labeled as the Aftershock normalized incident envelope, not a proven native DataHub Action payload. Render the dashboard from returned receipts and only show overall success when all required controls and write-back succeed.
-
-- [ ] **Step 4: Run UI tests and full regression suite**
-
-Run: `python -m pytest -q`
-
-Expected: all tests pass.
-
-- [ ] **Step 5: Commit**
-
-```powershell
-git add src/lineage_listener.py src/demo_dashboard.py tests/test_lineage_listener.py tests/test_demo_dashboard.py
-git commit -m "feat: expose honest MCP incident workflow"
-```
-
-### Task 6: Reproducible DataHub setup and submission artifacts
-
-**Files:**
-- Create: `config/aftershock_structured_properties.yaml`
-- Create: `scripts/bootstrap_datahub_demo.py`
-- Create: `tests/test_bootstrap_datahub_demo.py`
-- Create: `tests/test_live_datahub_mcp.py`
-- Replace: `README.md`
-- Create: `docs/live-datahub-setup.md`
-- Create: `docs/RFC-Action-Provenance-Ledger.md`
-- Create: `docs/FEEDBACK_SURVEY_DRAFT.md`
-- Modify: `docs/devpost-pitch.md`
-- Modify: `docs/video-script.md`
-- Create: `examples/execution_log.txt`
-- Create: `examples/remediation_report.json`
-
-- [ ] **Step 1: Write failing bootstrap contract tests**
-
-Assert the structured-property YAML declares `aftershock.businessAction` and `aftershock.remediationWebhook` as single string properties for DataJob and MLModel entity types. Dataset is deliberately excluded because it is the incident source, not a compensating-control target. Assert bootstrap dry-run output includes all demo URNs and no token values.
-
-- [ ] **Step 2: Run the bootstrap test and verify RED**
-
-Run: `python -m pytest tests/test_bootstrap_datahub_demo.py -q`
-
-Expected: setup artifacts do not exist.
-
-- [ ] **Step 3: Implement setup artifacts**
-
-The script must support `--dry-run` and `--apply`, create demo assets using `acryl-datahub`, attach the two structured properties, and add supported lineage. It must require `DATAHUB_GMS_URL` for `--apply` and never print `DATAHUB_GMS_TOKEN`. Bound the definition CLI subprocess with a hard timeout, configure the SDK's request timeout and retry limit directly, and convert every third-party apply-stage exception into fixed secret-safe output without catching process-control exceptions.
-
-Add an integration test marked `live_datahub` and skipped unless `RUN_LIVE_DATAHUB_TESTS=1`; it must execute real MCP lineage and `save_document` and assert a returned document URN. Its index-propagation poll must use a bounded monotonic deadline and wait for the seeded DataJob plus both structured properties without any fixture fallback.
-
-- [ ] **Step 4: Write rule-accurate documentation**
-
-README must distinguish verified offline MCP protocol tests from an optional live DataHub run. Keep Apache-2.0 information, category, architecture, exact setup commands, limitations, and AI-assistance disclosure. The RFC must say “proposal,” the feedback prize must not be called guaranteed, and the pitch must avoid “native webhook” unless the adapter is implemented.
-
-- [ ] **Step 5: Capture real examples**
-
-Run:
-
-```powershell
-python src\demo_dashboard.py
-python -m pytest -q
-```
-
-Copy the actual verified fixture-mode output and serialized report into `examples/`; label both as deterministic offline examples.
-
-- [ ] **Step 6: Commit**
-
-```powershell
-git add config scripts tests README.md docs examples
-git commit -m "docs: add reproducible DataHub MCP submission package"
-```
-
-### Task 7: Verification and review
-
-**Files:**
-- Review every changed file
-
-- [ ] **Step 1: Run complete automated verification**
+The custom Action adapter is not implemented in this plan.
+
+## Task 7 — Safe live metadata bootstrap
+
+**Files:** `config/aftershock_structured_properties.yaml`,
+`scripts/bootstrap_datahub_demo.py`, bootstrap/live tests.
+
+- [x] Pin the DataHub SDK and define the two SINGLE string properties for
+  DataJob/MLModel targets.
+- [x] Seed namespaced `DEV` Dataset, DataFlow, and DataJob assets and only a
+  supported Dataset-to-DataJob lineage edge.
+- [x] Keep the remediation endpoint loopback and clearly non-running until the
+  operator supplies an authorized receiver.
+- [x] Make dry-run network-free and print only a canonical, sanitized target
+  origin plus the exact plan.
+- [x] Require exact `--confirm-target` for apply.
+- [x] Require `--allow-remote-target` for nonloopback apply.
+- [x] Check all exact seed URNs for collisions before any mutation; permit a
+  deliberate rerun only with `--allow-existing-demo-assets`.
+- [x] Bound structured-property CLI and SDK operations and return secret-safe
+  stage errors.
+- [x] Gate the real MCP lineage/`save_document` test behind
+  `RUN_LIVE_DATAHUB_TESTS=1` and a bounded propagation poll.
+
+Compatibility floor: with `mcp-server-datahub==0.6.0`, `save_document` needs
+DataHub OSS 1.4.0 or newer, or DataHub Cloud 0.3.16 or newer, with mutation
+tools and document-write permission enabled.
+
+## Task 8 — Submission artifacts and verification
+
+**Files:** README, live setup, pitch, video script, RFC, feedback draft,
+examples, and submission checklist.
+
+- [x] Explain category fit as deterministic agency without a generative claim.
+- [x] Document the five receipt states, allowlist, deadlines, bootstrap gates,
+  and operator responsibility boundaries.
+- [x] Keep fixture, in-process MCP protocol, and live proof claims distinct.
+- [x] Provide captured fixture examples, setup commands, Apache-2.0 license,
+  RFC proposal, feedback draft, and under-three-minute video script.
+- [x] Add a checklist that leaves merge/push/public access/license detection,
+  project URL, video publication, and Devpost submission as human actions.
+
+Final technical verification commands:
 
 ```powershell
 python -m pytest -q
 python -m compileall -q src scripts
+python src\demo_dashboard.py
+$env:DATAHUB_GMS_URL = "http://localhost:8080"
+python scripts\bootstrap_datahub_demo.py --dry-run
 git diff --check main...HEAD
 ```
 
-- [ ] **Step 2: Run both demos**
+The live gate must remain reported as pending unless it runs without a skip
+against a named instance and the saved document is independently verified.
 
-Run the fixture dashboard and bootstrap dry run. Verify every displayed claim is backed by receipts or is explicitly labeled simulated/offline.
+## Human submission boundary
 
-- [ ] **Step 3: Independent spec and quality review**
+The following are intentionally not marked complete by implementation work:
 
-Dispatch independent reviewers against the approved design and this plan. Fix every Critical or Important finding and rerun the full verification commands.
+- [ ] merge/integrate and push the reviewed branch;
+- [ ] make the repository public;
+- [ ] verify Apache-2.0 detection and all links while signed out;
+- [ ] publish an accessible project URL;
+- [ ] record and publish the under-three-minute video;
+- [ ] complete and submit the Devpost entry.
 
-- [ ] **Step 4: Record exact live boundary**
-
-If Docker remains unavailable, report that the real MCP protocol is verified in process but a live DataHub persistence run remains pending. Do not claim live DataHub completion without a fresh successful live test.
+Use `docs/submission-checklist.md` for the full handoff.

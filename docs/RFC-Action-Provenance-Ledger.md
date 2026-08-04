@@ -24,9 +24,10 @@ an edge alone does not answer:
 - which stable action IDs a compensating service should receive; or
 - whether a prior compensation attempt already settled.
 
-Aftershock's current MVP therefore invokes controls at the exposed-system
-level and reports exactly what those endpoints return. The proposed ledger
-adds the missing provenance needed for selective action handling.
+Aftershock's current MVP therefore invokes governed controls at the
+exposed-system level and stores normalized, secret-safe receipts. It does not
+persist arbitrary response bodies. The proposed ledger adds the missing
+provenance needed for selective action handling.
 
 ## Goals
 
@@ -60,7 +61,7 @@ An `ActionExecution` record would contain:
 | `consumption_start` / `consumption_end` | UTC interval or watermark bounds |
 | `occurred_at` | Producer-observed action timestamp |
 | `target_reference` | Opaque reference usable by the owning system |
-| `idempotency_key` | Stable retry key, not an execution guarantee |
+| `idempotency_key` | Stable retry key, not exactly-once evidence |
 | `status` | Observed producer state |
 | `retention_class` | Policy controlling expiry and redaction |
 
@@ -125,13 +126,32 @@ reuses the same key. Conflicting terminal receipts are retained and escalated;
 they are not collapsed into a synthetic success. Ledger persistence failure
 does not relabel an already observed external control result.
 
+The current Aftershock v1 receiver contract supplies a concrete baseline for
+the ledger. A terminal success requires an eligible non-202 response containing
+`receipt_version: 1`, `status: succeeded`, and a valid external `receipt_id`.
+`accepted` and `pending` are nonterminal on ordinary success-class responses.
+A 4xx other than 408 is a failed rejection. HTTP 408 and 5xx are
+`outcome_unknown` unless they carry a valid v1 terminal success/failure receipt,
+which is honored. Transport failure after dispatch, deadline expiry after
+dispatch, or a missing terminal contract is also `outcome_unknown`. Work denied
+by policy or not dispatched before the deadline is `skipped`. The ledger must
+preserve all five states rather than converting transport signals into inferred
+business outcomes.
+
+Endpoint authorization remains separate from action provenance. The current
+engine requires exact URL allowlisting, rejects user information/fragments,
+requires HTTPS away from loopback, and disables redirects. A future ledger
+should reference a governed playbook identity, not copy credentials or broaden
+network authorization. DataHub RBAC and infrastructure egress enforcement
+remain operator-controlled layers.
+
 ## Privacy, security, and retention
 
 - Store opaque IDs and metadata, not customer or financial payloads.
 - Apply ownership, domain, and policy metadata to the ledger entity/aspect.
 - Separate read, append, and compensation permissions.
 - Encrypt transport and backing stores; never store control credentials in
-  structured properties.
+  structured properties, action records, or endpoint URLs.
 - Define retention by action class and jurisdiction, with deletion/redaction
   events that preserve aggregate coverage evidence.
 - Audit every query and mutation made by a remediation agent.

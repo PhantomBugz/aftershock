@@ -1,38 +1,50 @@
 # Aftershock
 
 Aftershock is a DataHub-backed incident-response agent for the **Agents That Do
-Real Work** challenge. It turns downstream lineage and governed metadata into
-an operational workflow: discover exposed systems, invoke their configured
-compensating controls, capture structured receipts, and write an incident
-summary back to DataHub for the next person or agent.
+Real Work** challenge. It is a deterministic, policy-driven agent loop:
+
+```text
+observe DataHub context -> decide from governed metadata and policy
+                        -> act through an allowlisted control
+                        -> persist receipts back to DataHub
+```
+
+Aftershock does not claim generative or LLM reasoning. Its agency comes from
+closing this governed observe/decide/act/persist loop after an authenticated
+incident trigger.
 
 We use **Action Debt** as project terminology for operational follow-up created
 when an automated system acts on data that is later found to be unreliable.
 
 ## What it does
 
-For a critical, normalized incident envelope, Aftershock:
+For a critical Aftershock-normalized incident envelope, the workflow:
 
 1. calls the official `mcp-server-datahub==0.6.0` through FastMCP;
 2. discovers downstream assets with `get_lineage(upstream=false)`;
 3. fetches entity metadata with `get_entities`;
 4. reads the exact structured-property qualified names
    `aftershock.businessAction` and `aftershock.remediationWebhook`;
-5. concurrently POSTs the configured compensating controls and records a
-   success, failure, or skipped receipt for each target; and
-6. calls `save_document` through MCP to persist the incident-specific receipt
-   summary and related asset URNs in DataHub.
+5. checks every endpoint against an operator-controlled exact URL allowlist;
+6. invokes bounded, asynchronous compensating controls and records factual
+   receipts; and
+7. calls `save_document` through MCP to persist the incident summary and
+   related asset URNs for the next operator or agent.
 
-Each control request includes a deterministic `Idempotency-Key`. That gives a
-downstream service a stable retry key; it is not, by itself, proof of
-exactly-once execution.
+## DataHub is the foundation
 
-## Architecture
+Aftershock does not rebuild catalog or lineage capabilities. DataHub supplies
+the downstream context, governed playbook metadata, and durable organizational
+memory. Live mode never changes to fixture data after a failed MCP call.
+
+For `mcp-server-datahub==0.6.0`, the adapter passes `max_hops=3`; in this pinned
+server contract that value means unlimited lineage traversal, not a finite hop
+limit. Results are paginated and validated fail-closed before controls run.
 
 ```text
 DataHub incidentInfo MetadataChangeLogEvent
                     |
-        custom DataHub Action adapter       (production integration; not included)
+        custom DataHub Action adapter       (not implemented)
                     |
         authenticated normalized envelope
                     |
@@ -42,19 +54,75 @@ DataHub incidentInfo MetadataChangeLogEvent
         |                  |                 |
  get_lineage         get_entities       save_document
         |                  |                 |
-        +---- actionable targets ----+       |
-                                     |       |
-                         compensating controls
-                                     |
-                         structured receipts + DataHub record
+        +---- governed target policy ----+  |
+                                        |  |
+                            allowlisted controls
+                                        |
+                         receipts + DataHub incident record
 ```
 
-The current API accepts an **Aftershock-normalized incident envelope**. A
-production event integration would translate DataHub's `incidentInfo`
-MetadataChangeLogEvent with a custom DataHub Action, then send an authenticated
-HTTP request to Aftershock. That Action adapter is not part of this repository.
-See DataHub's [MetadataChangeLogEvent reference][mcl] and
-[custom Action guide][actions].
+The current API begins after the authenticated normalized trigger. A production
+event integration would translate DataHub's `incidentInfo`
+MetadataChangeLogEvent with a custom DataHub Action, then POST the normalized
+contract to Aftershock. That adapter remains future integration work. See the
+[MetadataChangeLogEvent reference][mcl] and [custom Action guide][actions].
+
+## Receipt contract: HTTP is not the outcome
+
+Every target settles into one of five states:
+
+| Status | Meaning |
+| --- | --- |
+| `succeeded` | An eligible non-202 response contained the required v1 terminal `succeeded` contract and a valid external receipt ID. A 408/5xx is honored only when it carries that terminal contract. |
+| `accepted` | The receiver acknowledged work, but no terminal outcome is known. HTTP 202 and accepted/pending contracts on ordinary success-class responses are nonterminal. |
+| `failed` | The request failed before dispatch, was rejected with a 4xx other than 408, encountered a disabled redirect, or returned a valid v1 terminal failure receipt. |
+| `skipped` | The playbook was incomplete, its exact endpoint was denied, or the workflow deadline expired before dispatch. |
+| `outcome_unknown` | Dispatch may have occurred, but a 408/5xx without a valid terminal receipt, transport failure, deadline expiry, or another invalid/missing terminal response left the outcome unproven. |
+
+The success response contract is:
+
+```json
+{
+  "receipt_version": 1,
+  "status": "succeeded",
+  "receipt_id": "receiver-generated-stable-id"
+}
+```
+
+The external receipt ID is shown in the API, dashboard, and DataHub incident
+document. Extra response fields are ignored and never establish success. A
+plain HTTP 200 is not business-success evidence. An explicit v1 terminal
+success/failure receipt is honored on HTTP 408/5xx; without one, those
+ambiguous responses remain `outcome_unknown`.
+
+The API returns `completed` only when every discovered control is terminal
+`succeeded` **and** the DataHub write-back succeeds. `accepted` and
+`outcome_unknown` therefore produce `completed_with_issues`.
+
+Each dispatched request carries a deterministic `Idempotency-Key` derived from
+the incident, target, and business action. It is a stable retry key, not proof
+of exactly-once execution. The engine uses at most eight workers and a
+30-second workflow deadline by default. At the deadline, dispatched work is
+conservatively `outcome_unknown`; work not yet dispatched is `skipped`.
+
+## Governed outbound controls
+
+Critical listener sessions require `AFTERSHOCK_REMEDIATION_ALLOWLIST_JSON`, a
+nonempty JSON array of exact URLs:
+
+```powershell
+$env:AFTERSHOCK_REMEDIATION_ALLOWLIST_JSON = '["http://127.0.0.1:8765/remediate/cancel_po"]'
+```
+
+Authorization is exact: scheme, host, port, path, and query must match the
+metadata value. User information and fragments are rejected. Plain HTTP is
+allowed only for loopback hosts; nonloopback endpoints require HTTPS.
+Redirects are disabled. Query values may participate in authorization but are
+removed from logs and persisted receipt endpoints.
+
+Never put credentials in a structured property or URL. DataHub property-write
+RBAC, document-mutation permissions, receiver authentication, and network
+egress policy remain operator responsibilities.
 
 ## Run the deterministic demonstration
 
@@ -71,29 +139,24 @@ python src\demo_dashboard.py
 ```
 
 The dashboard is unmistakably labeled **OFFLINE FIXTURE MODE**. It uses local,
-deterministic lineage, `httpx.MockTransport` control responses, and an in-memory
-write-back recorder. It does not represent a live DataHub run.
+deterministic lineage, an exact in-memory allowlist, `httpx.MockTransport`
+responses containing valid v1 terminal receipts, and an in-memory write-back
+recorder. It does not represent a live DataHub run.
 
 The protocol tests use an in-process FastMCP server and genuine MCP/JSON-RPC
 exchanges. They verify tool arguments, parsing, failure behavior, and write-back
 contracts, but they are not evidence of persistence to a live DataHub instance.
 
-## Run the listener
+## Run the listener in fixture context
 
-Set an explicit context mode and a secret used to authenticate critical
-requests. This fixture command exercises the HTTP contract, but its configured
-example remediation hosts are intentionally non-production and will normally
-produce failed control receipts. Use the dashboard above for a deterministic
-all-success presentation.
-
-Fixture metadata is explicitly synthetic and uses `PROD` URNs. The separate
-live bootstrap uses collision-checked, uniquely namespaced `DEV` assets such as
-`aftershock_demo.inventory_pricing`; see the [live setup guide][live-setup] for
-the mandatory target confirmation and exact commands.
+This command exercises the real API and policy configuration, but the fixture
+endpoints are reserved example hosts and normally do not produce successful
+receipts. Use the dashboard for a deterministic presentation.
 
 ```powershell
 $env:AFTERSHOCK_DATAHUB_MODE = "fixture"
 $env:AFTERSHOCK_WEBHOOK_TOKEN = "replace-with-a-long-random-secret"
+$env:AFTERSHOCK_REMEDIATION_ALLOWLIST_JSON = '["https://api.internal.example/remediate/cancel_po","https://api.internal.example/remediate/revert_pricing"]'
 python -m uvicorn lineage_listener:app --app-dir src --host 127.0.0.1 --port 8000
 ```
 
@@ -116,34 +179,35 @@ Invoke-RestMethod `
 ```
 
 Critical envelopes require `Authorization: Bearer <AFTERSHOCK_WEBHOOK_TOKEN>`.
-The endpoint returns HTTP 200 with `completed` only when every discovered
-control and the DataHub write-back succeed. Otherwise it returns
-`completed_with_issues` and the factual receipts. Invalid input returns 422;
-missing or invalid authorization returns 401; missing authentication
-configuration or unavailable DataHub processing returns a fixed, secret-safe
-503. Noncritical envelopes return `ignored` before opening a DataHub context.
+Invalid input returns 422; missing or invalid authorization returns 401;
+missing authentication/allowlist configuration or unavailable DataHub
+processing returns a fixed, secret-safe 503. Noncritical envelopes return
+`ignored` before opening a DataHub context or constructing the allowlist.
 
-For a real instance, follow [Live DataHub setup](docs/live-datahub-setup.md).
+Fixture metadata is explicitly synthetic and uses `PROD` URNs. The separate
+live bootstrap uses collision-checked, namespaced `DEV` assets. Follow the
+[live setup guide][live-setup] for mandatory target confirmation, collision
+handling, receiver requirements, and exact commands.
 
 ## Repository map
 
 - `src/datahub_context.py` — explicit fixture and MCP context adapters
 - `src/blast_radius_mapper.py` — lineage-to-structured-playbook mapping
-- `src/compensating_action_engine.py` — concurrent controls and receipts
+- `src/compensating_action_engine.py` — governed execution and receipts
 - `src/incident_processor.py` — read, act, and `save_document` orchestration
 - `src/lineage_listener.py` — authenticated normalized-envelope API
 - `src/demo_dashboard.py` — receipt-driven offline presentation
-- `config/` and `scripts/` — live structured-property and seed bootstrap
-- `tests/` — unit, protocol, API, dashboard, and opt-in live tests
-- `examples/` — captured sample output, labeled by execution mode
+- `config/` and `scripts/` — safe live metadata bootstrap
+- `tests/` — unit, MCP protocol, API, dashboard, and opt-in live tests
+- `examples/` — captured outputs labeled by execution mode
+- `docs/submission-checklist.md` — human actions still required before entry
 
 ## Current boundary
 
 The MVP operates at the **system-exposure and compensating-control level**. A
-lineage edge shows that a downstream asset is exposed; it does not prove which
-individual records that system read or which external actions resulted. The
-MVP therefore does not claim row-level causality, individual-action recovery,
-or exactly-once control execution.
+lineage edge shows downstream exposure; it does not prove which individual
+records a system read or which external actions resulted. The MVP therefore
+does not claim row-level causality or individual-action recovery.
 
 The proposed [Action-Provenance Ledger RFC](docs/RFC-Action-Provenance-Ledger.md)
 describes a future path to action IDs, incident windows, and more selective
@@ -151,11 +215,11 @@ controls. It is a project proposal, not an upstream contribution.
 
 ## Reproducibility and live-proof status
 
-The MCP server and FastMCP protocol dependencies are exact-pinned. Offline
-tests and demo inputs are deterministic. Live persistence was not executed in
-the development environment because no running DataHub deployment or live
-credentials were available. The opt-in live test in the setup guide is the
-proof gate; a skipped live test is not a successful live result.
+The MCP server, FastMCP, and DataHub SDK integration dependencies are pinned.
+Offline tests and demo inputs are deterministic. Live persistence was not run
+in the development environment because no running DataHub deployment or live
+configuration was available. The opt-in live test in the setup guide is the
+proof gate; a skipped test is not a successful live result.
 
 Useful DataHub references:
 
@@ -170,9 +234,13 @@ test, review, and document the project. The project concept, acceptance
 criteria, architecture decisions, and submission decisions remain under human
 direction and review.
 
-## License
+## License and submission status
 
-Licensed under the [Apache License 2.0](LICENSE).
+Licensed under the [Apache License 2.0](LICENSE). Merging and pushing the final
+branch, making the repository public, verifying license detection while signed
+out, publishing the project/video URLs, and completing the Devpost form are
+human submission steps. They are not represented as complete here; use the
+[submission checklist](docs/submission-checklist.md).
 
 [mcp]: https://docs.datahub.com/docs/features/feature-guides/mcp
 [properties]: https://docs.datahub.com/docs/api/tutorials/structured-properties

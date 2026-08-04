@@ -1,155 +1,250 @@
 # Real DataHub MCP Integration Design
 
-**Status:** Approved on 2026-08-04
+**Status:** Approved on 2026-08-04; reconciled with the governed receipt and
+safe-bootstrap contracts.
 
-## Goal
+## Goal and category fit
 
-Turn Aftershock from an offline GraphQL-and-webhook demonstration into an honest DataHub agent application that reads downstream context through the official DataHub MCP Server, executes compensating controls, and persists an incident-specific remediation document through MCP for later people and agents.
+Aftershock is an honest DataHub agent application in the **Agents That Do Real
+Work** category. It is a deterministic, policy-driven loop:
+
+```text
+observe context -> decide from governed metadata/policy
+                -> act through an allowlisted control
+                -> persist evidence for later people and agents
+```
+
+The project does not claim generative or LLM reasoning. It begins after an
+authenticated Aftershock-normalized incident trigger.
 
 ## Scope
 
-The implementation will:
+The implementation:
 
-- call the official `get_lineage` MCP tool with `upstream=false`;
-- call `get_entities` to read Aftershock playbook configuration from DataHub structured properties;
-- issue real asynchronous HTTP requests to configured remediation endpoints;
-- return structured receipts for succeeded, failed, and skipped controls;
-- call `save_document` through MCP after the controls finish;
-- link the remediation document to the corrupted source and every affected downstream asset;
-- provide an explicit offline fixture mode for deterministic tests and video rehearsal;
-- fail visibly in live MCP mode instead of falling back to fixtures;
-- remove unsupported monetary and transaction-level claims;
-- provide reproducible local-DataHub instructions, sample output, an RFC proposal, and feedback copy.
+- reads downstream context through the official DataHub MCP Server;
+- calls `get_lineage(upstream=false)` and `get_entities`;
+- maps exact DataHub structured-property qualified names into typed targets;
+- applies an exact outbound URL policy before dispatch;
+- executes controls with bounded concurrency and a workflow deadline;
+- classifies five factual receipt states without inferring business success
+  from HTTP transport alone;
+- calls `save_document` through MCP after controls settle;
+- links the incident document to the source and downstream asset URNs;
+- provides explicit, labeled fixture mode for deterministic verification; and
+- provides a collision-checked, confirmed-target `DEV` bootstrap for a live
+  DataHub instance.
 
-The implementation will not claim that the MVP identifies individual transactions, proves a native DataHub Actions event envelope, or has reversed production money. Those remain separate future integrations.
+The MVP does not claim record-level causality, individual-action recovery, a
+DataHub Action ingress adapter, a completed live DataHub run in this development
+environment, or exactly-once control execution.
 
 ## Architecture
 
 ```text
-DataHub incident envelope
+incidentInfo MetadataChangeLogEvent
+        |
+        +--> custom DataHub Action adapter (production boundary; not implemented)
+        |
+authenticated Aftershock-normalized envelope
         |
         v
 AftershockIncidentProcessor
         |
         +--> BlastRadiusMapper
-        |       |
         |       +--> DataHubContextPort
-        |               +--> MCPDataHubContext (live)
+        |               +--> MCPDataHubContext
         |               |       get_lineage(upstream=false)
         |               |       get_entities(...)
-        |               |
-        |               +--> FixtureDataHubContext (offline, labeled)
+        |               +--> FixtureDataHubContext (explicitly labeled)
         |
         +--> CompensatingActionEngine
-        |       +--> concurrent remediation HTTP calls
-        |       +--> RemediationReceipt[]
+        |       +--> exact URL policy
+        |       +--> bounded workers + workflow deadline
+        |       +--> governed HTTP POSTs, redirects disabled
+        |       +--> five-state RemediationReceipt[]
         |
-        +--> DataHubContextPort.save_remediation_document(...)
-                +--> save_document via MCP
+        +--> DataHubContextPort.save_document(...)
+                +--> incident summary through MCP
 ```
 
-`MCPDataHubContext` owns only DataHub MCP concerns. `BlastRadiusMapper` converts DataHub entities into actionable targets. `CompensatingActionEngine` owns only external control execution. `AftershockIncidentProcessor` coordinates the transaction and writes the final evidence document.
+`MCPDataHubContext` owns MCP transport and tool normalization.
+`BlastRadiusMapper` owns lineage/entity-to-target mapping.
+`CompensatingActionEngine` owns outbound policy, execution, and receipt
+classification. `AftershockIncidentProcessor` coordinates the loop and writes
+one incident document.
 
-## Configuration and Modes
+## DataHub MCP contract
 
-`AFTERSHOCK_DATAHUB_MODE` accepts exactly:
+Live MCP mode uses `mcp-server-datahub==0.6.0` and FastMCP 3.4.5. It supports:
 
-- `mcp`: connect to a real MCP server. Any connection, tool, or parsing error is returned as an error; no fallback occurs.
-- `fixture`: read `mock-data/datahub_lineage.json` and write the generated document to an in-memory fixture recorder. Every API response and dashboard screen identifies this as `OFFLINE FIXTURE MODE`.
+- `DATAHUB_MCP_URL` with a separate optional `DATAHUB_MCP_TOKEN` for a remote
+  Streamable HTTP MCP server; or
+- a local stdio child launched with the current Python interpreter, explicit
+  `DATAHUB_GMS_URL`, optional `DATAHUB_GMS_TOKEN`,
+  `DATAHUB_SKIP_CONFIG=true`, and `TOOLS_IS_MUTATION_ENABLED=true`.
 
-Live MCP transport supports:
+GMS credentials are never forwarded to an arbitrary remote MCP URL. MCP
+connection, tool, payload, or pagination errors fail closed; live mode never
+changes to fixture data.
 
-- `DATAHUB_MCP_URL`: streamable HTTP MCP endpoint, with the separate `DATAHUB_MCP_TOKEN` sent as a bearer token when present;
-- otherwise, a stdio child process launched with the current Python interpreter as `python -m mcp_server_datahub`, receiving `DATAHUB_GMS_URL`, `DATAHUB_GMS_TOKEN`, and `TOOLS_IS_MUTATION_ENABLED=true` in its environment.
+The adapter calls `get_lineage` with `upstream=false`, `max_results=100`, and
+`max_hops=3`. For the pinned server, `max_hops=3` is the sentinel for unlimited
+lineage traversal; it must not be described as a finite hop cap. The adapter
+validates offsets, totals, returned counts, continuation state, repeated pages,
+and global safety limits before accepting a blast radius.
 
-Secrets must never be printed or committed.
+`save_document` with this server version requires DataHub OSS 1.4.0 or newer,
+or DataHub Cloud 0.3.16 or newer, plus enabled mutation tools and appropriate
+document-write permission.
 
-The live bootstrap is bounded: the structured-property CLI subprocess has a
-hard 30-second timeout, while DataHub SDK calls use a 10-second request timeout
-and at most one retry for the configured transient HTTP statuses. Every apply
-stage converts third-party exceptions into fixed, secret-safe errors while
-allowing process-control exceptions to propagate. The opt-in live proof polls
-for the seeded DataJob and both playbook properties only within a fixed
-monotonic deadline; it never falls back to fixture data.
+## Metadata contract
 
-## DataHub Metadata Contract
+Actionable DataJob or MLModel entities use two single-string structured
+properties, matched by exact qualified name:
 
-Actionable entities use two structured properties:
+- `aftershock.businessAction` — stable action identifier such as `ISSUE_PO`;
+- `aftershock.remediationWebhook` — complete HTTP(S) control endpoint.
 
-- `aftershock.businessAction`: stable action identifier such as `ISSUE_PO`;
-- `aftershock.remediationWebhook`: absolute HTTP or HTTPS remediation endpoint.
+The mapper retains a lineage target even when either property is absent. The
+engine then emits a `skipped` receipt; missing metadata is never interpreted as
+success.
 
-The mapper will accept the official MCP entity response shapes and normalize them into:
+## Governed endpoint policy
 
-```json
-{
-  "urn": "urn:li:dataJob:(urn:li:dataFlow:(airflow,aftershock_demo,PROD),purchase_order_generator)",
-  "entity_type": "DATA_JOB",
-  "business_action": "ISSUE_PO",
-  "remediation_webhook": "https://api.internal.example/remediate/cancel_po"
-}
-```
+The listener requires `AFTERSHOCK_REMEDIATION_ALLOWLIST_JSON`, a nonempty JSON
+array of exact URL strings. Policy rules are:
 
-Entities missing either required property are excluded from control execution and represented by skipped receipts rather than silently treated as successful.
+- metadata URL and allowlist entry must match exactly, including query/path;
+- user information, fragments, whitespace, and control characters are denied;
+- nonloopback endpoints require HTTPS; loopback HTTP is allowed for local
+  development;
+- redirects are disabled even if the supplied HTTP client would follow them;
+- query information is removed from logs and persisted endpoint fields; and
+- a missing, malformed, or empty allowlist fails before context creation.
 
-## Remediation Receipts
+Credentials must not be placed in structured properties or URLs. DataHub
+property/document RBAC, receiver authentication, and network egress controls
+remain operator responsibilities.
 
-Each attempted control returns a serializable receipt containing:
+## Request and idempotency contract
 
-- incident ID;
-- target URN and entity type;
-- business action;
-- endpoint host/path without credentials;
-- status: `succeeded`, `failed`, or `skipped`;
-- HTTP status when available;
-- error summary when applicable.
-
-The HTTP request body remains:
+The control request body is:
 
 ```json
 {
   "incident_id": "INC-9942",
-  "target_urn": "...",
+  "target_urn": "urn:li:dataJob:...",
   "action": "REVERT_STATE",
   "business_action": "ISSUE_PO"
 }
 ```
 
-Each request also includes an opaque, deterministic `Idempotency-Key` header
-derived from the incident ID, target URN, and business action. Downstream
-services can therefore deduplicate retries without Aftershock exposing those
-values in the header itself.
+Each dispatch includes a deterministic opaque `Idempotency-Key` derived from
+the incident ID, target URN, and business action. It is a stable retry key for
+the receiver, not proof of exactly-once execution.
 
-## MCP Write-Back
+## Receipt contract
 
-After all controls settle, the processor calls `save_document` once. The document contains the incident ID, source dataset, execution mode, timestamp, and a table of all receipts. `related_assets` contains the source dataset and downstream target URNs. A deterministic document URN is reused for the same incident so retries update the record instead of creating ambiguous duplicates.
+Each immutable receipt contains incident ID, target URN/type, business action,
+sanitized endpoint, status, HTTP status when observed, external receipt ID when
+valid, and a controlled error summary.
 
-Write-back failure is reported separately from remediation failure. A successful HTTP control is never relabeled as failed merely because DataHub persistence failed, and the overall response never claims the incident is fully recorded unless `save_document` succeeds.
+The five statuses are:
 
-## Testing Strategy
+- `succeeded` — only an eligible non-202 response containing the required v1
+  terminal success contract with a valid external receipt ID; 408/5xx are
+  eligible only when that terminal contract is present;
+- `accepted` — HTTP 202 or an accepted/pending acknowledgment on an ordinary
+  success-class response; it is nonterminal;
+- `failed` — pre-dispatch failure, 4xx rejection other than 408, disabled
+  redirect, or a valid v1 terminal failure receipt;
+- `skipped` — incomplete/denied policy or deadline expiry before dispatch;
+- `outcome_unknown` — 408/5xx without a valid terminal success/failure receipt,
+  transport failure after dispatch, deadline expiry after dispatch, or a
+  success-class response without a valid terminal receipt.
 
-Tests use a real in-process MCP transport from the same FastMCP 3.x stack used by the official DataHub MCP Server. The test server records tool names and JSON arguments while returning deterministic DataHub-shaped payloads. This verifies MCP initialization and `tools/call` behavior without claiming that Docker or a live DataHub instance was used.
+Terminal success requires:
 
-TDD cycles cover:
+```json
+{
+  "receipt_version": 1,
+  "status": "succeeded",
+  "receipt_id": "receiver-generated-stable-id"
+}
+```
 
-1. `get_lineage(upstream=false)` and `get_entities` calls;
-2. structured-property normalization;
-3. explicit fixture/live behavior and fail-closed errors;
-4. structured remediation receipts for HTTP success and failure;
-5. `save_document` arguments and incident-document content;
-6. listener response semantics;
-7. dashboard wording and removal of unsupported numbers;
-8. an opt-in live test guarded by environment variables.
+HTTP status alone is never terminal business-success evidence. A valid v1
+terminal success/failure receipt on 408/5xx is authoritative; otherwise these
+ambiguous statuses remain unknown. Extra response fields do not change
+classification and are not logged.
 
-## Demo Truthfulness
+## Bounded execution
 
-The default dashboard uses fixture mode and says so. It will show each deterministic HTTP-test receipt and the fixture recorder write-back receipt. A separate live command is documented for a running DataHub Quickstart and official MCP Server. The demo says “system-level compensating controls accepted” rather than “transactions reversed” or “enterprise state restored.”
+The engine defaults to at most eight workers and one 30-second deadline across
+the control phase. It preserves input order. When the deadline expires, a
+dispatched target is `outcome_unknown`; a target not yet dispatched is
+`skipped`. Process-control cancellation propagates after worker cleanup.
 
-## Repository Deliverables
+## DataHub write-back and completion
 
-- Apache-2.0 license retained unchanged;
-- complete README and live setup guide;
-- `examples/` output captured from a verified demo run;
-- formal Action-Provenance Ledger RFC, clearly labeled as a project proposal rather than an accepted upstream contribution;
-- feedback-survey draft with actionable DataHub developer-experience feedback;
-- optional upstream contribution handled separately after this branch is finalized.
+After controls settle, the processor calls `save_document` once. The Summary
+contains the incident/source/mode/timestamp and every receipt, including the
+external receipt ID. `related_assets` contains the unique source and target
+URNs. A deterministic incident/source-derived document URN makes retries update
+the same logical record.
+
+Write-back failure is separate from control status. Overall API/dashboard
+`completed` requires all discovered receipts to be `succeeded` and the
+write-back to be `succeeded`; any accepted, failed, skipped, unknown, or
+write-back failure yields `completed_with_issues`.
+
+## Ingress contract
+
+The FastAPI route accepts an authenticated normalized envelope containing
+`incident_id`, Dataset URN, and severity. Critical requests require a bearer
+value matching `AFTERSHOCK_WEBHOOK_TOKEN`. Noncritical input is ignored before
+authentication, context construction, or allowlist parsing.
+
+Production integration is:
+
+```text
+DataHub incidentInfo MetadataChangeLogEvent
+  -> custom DataHub Action adapter
+  -> authenticated normalized POST
+  -> Aftershock
+```
+
+The custom Action adapter is not part of the MVP.
+
+## Safe live bootstrap
+
+The bootstrap creates exactly these synthetic, namespaced assets:
+
+- `urn:li:dataset:(urn:li:dataPlatform:postgres,aftershock_demo.inventory_pricing,DEV)`;
+- `urn:li:dataFlow:(airflow,aftershock_demo,DEV)`;
+- `urn:li:dataJob:(urn:li:dataFlow:(airflow,aftershock_demo,DEV),purchase_order_generator)`.
+
+Dry-run creates no client and prints only a sanitized canonical target origin.
+Apply requires `--confirm-target` equal to that origin. A nonloopback origin
+also requires `--allow-remote-target`. All three exact URNs are checked for
+collisions before any mutation; only a deliberate rerun may use
+`--allow-existing-demo-assets`.
+
+The bootstrap seeds Dataset-to-DataJob lineage only. Its loopback control URL
+is a non-running placeholder. An authorized receiver with the v1 receipt
+contract and an exact allowlist entry is required before that control can
+succeed.
+
+## Testing and truthfulness
+
+Tests use real in-process MCP initialization and `tools/call` exchanges through
+FastMCP plus deterministic DataHub-shaped responses. They cover pagination,
+structured properties, exact endpoint policy, redirects, concurrency,
+deadlines, all receipt states, write-back, listener authentication, and safe
+bootstrap behavior. These tests do not represent a live DataHub deployment.
+
+The Rich dashboard is labeled `OFFLINE FIXTURE MODE`. Its HTTP test doubles
+return valid terminal v1 receipts with external receipt IDs, and its DataHub
+write-back is an in-memory recorder. Live persistence remains pending until a
+fresh, non-skipped live gate succeeds and the document is independently seen in
+the configured DataHub instance.

@@ -29,6 +29,11 @@ newer, or DataHub Cloud 0.3.16 or newer. Before bootstrap or the live proof
 gate, verify the target version, confirm that `save_document` is available,
 and confirm that MCP mutation tools are enabled.
 
+The DataHub operator must also grant the bootstrap identity only the required
+asset, lineage, and structured-property write permissions, and grant the live
+MCP identity only the reads plus document mutation it needs. Aftershock does
+not configure DataHub RBAC.
+
 ## 3. Define and seed the demo metadata
 
 Configure the DataHub CLI for the target instance. Set the GMS URL before the
@@ -61,9 +66,34 @@ demo assets, add `--allow-existing-demo-assets`. A non-loopback target is also
 refused unless its canonical origin is confirmed and
 `--allow-remote-target` is supplied explicitly.
 
-The live bootstrap seeds the uniquely namespaced Postgres Dataset
-`aftershock_demo.inventory_pricing` in `DEV`, an Airflow DataFlow/DataJob in
-`DEV`, the two remediation properties on that DataJob, and one
+Exact collision-override example for the local demo namespace:
+
+```powershell
+python scripts\bootstrap_datahub_demo.py `
+  --apply `
+  --confirm-target "http://localhost:8080" `
+  --allow-existing-demo-assets
+```
+
+Exact remote-target form (replace the origin with the one printed by your dry
+run and review it before proceeding):
+
+```powershell
+python scripts\bootstrap_datahub_demo.py `
+  --apply `
+  --confirm-target "https://datahub.example:443" `
+  --allow-remote-target
+```
+
+The live bootstrap seeds exactly these namespaced `DEV` assets:
+
+```text
+urn:li:dataset:(urn:li:dataPlatform:postgres,aftershock_demo.inventory_pricing,DEV)
+urn:li:dataFlow:(airflow,aftershock_demo,DEV)
+urn:li:dataJob:(urn:li:dataFlow:(airflow,aftershock_demo,DEV),purchase_order_generator)
+```
+
+It assigns both remediation properties to the DataJob and creates one
 Dataset-to-DataJob lineage edge. It deliberately does not manufacture
 Dataset-to-MLModel lineage. The offline fixture remains an explicitly synthetic
 `PROD` graph and includes a labeled MLModel example only to exercise mixed
@@ -75,6 +105,27 @@ receiver exists at that exact URL and it is explicitly allowlisted in
 `AFTERSHOCK_REMEDIATION_ALLOWLIST_JSON`. Do not store endpoint credentials in
 structured-property values; use the downstream service's credential-management
 mechanism.
+
+The receiver must return the v1 terminal success contract only after its
+business operation is terminal:
+
+```json
+{
+  "receipt_version": 1,
+  "status": "succeeded",
+  "receipt_id": "receiver-generated-stable-id"
+}
+```
+
+An HTTP 200 without that contract is `outcome_unknown`; HTTP 202 and v1
+`accepted`/`pending` on ordinary success-class responses are nonterminal
+`accepted`. A 4xx response other than 408 is a failed rejection. HTTP 408 or a
+5xx response is `outcome_unknown` unless it carries a valid v1 terminal
+`succeeded` or `failed` receipt, which Aftershock honors. Network failure or
+workflow deadline expiry after dispatch is conservatively `outcome_unknown`;
+work that never dispatches before the deadline is `skipped`. The stable
+`Idempotency-Key` supports receiver-side deduplication but does not prove
+exactly-once execution.
 
 ## 4. Choose exactly one MCP transport
 
@@ -117,10 +168,27 @@ other.
 
 ## 5. Start the authenticated listener
 
+Configure an exact outbound policy. The value must be a nonempty JSON array of
+complete URLs. The seeded live endpoint is loopback and has no receiver until
+you start one you are authorized to operate:
+
 ```powershell
 $env:AFTERSHOCK_WEBHOOK_TOKEN = "replace-with-a-long-random-secret"
+$env:AFTERSHOCK_REMEDIATION_ALLOWLIST_JSON = '["http://127.0.0.1:8765/remediate/cancel_po"]'
 python -m uvicorn lineage_listener:app --app-dir src --host 127.0.0.1 --port 8000
 ```
+
+The metadata URL and allowlist entry must match exactly, including scheme,
+host, port, path, and query. User information and fragments are rejected.
+Plain HTTP is accepted only for `localhost` or an IP loopback address;
+nonloopback control endpoints require HTTPS. Redirects are never followed.
+Never place a credential in the URL or DataHub metadata. Receiver
+authentication and firewall/service-mesh policy must be supplied outside that
+metadata.
+
+The operator remains responsible for restricting process and network egress so
+Aftershock can reach only approved receivers. The application allowlist is one
+policy layer; it is not a replacement for infrastructure egress controls.
 
 Send the current normalized envelope from a second PowerShell window:
 
@@ -140,8 +208,12 @@ Invoke-RestMethod `
   -Body $body
 ```
 
-This request initiates real configured control calls. Inspect every returned
-receipt and confirm the returned write-back document URN in DataHub.
+This request initiates real configured control calls. The engine uses bounded
+concurrency (eight workers) and a 30-second workflow deadline by default.
+Inspect all five receipt counts (`succeeded`, `accepted`, `failed`, `skipped`,
+and `outcome_unknown`), every external receipt ID, and the returned write-back
+document URN. Overall `completed` requires every target to have terminal
+`succeeded` plus a successful DataHub write-back.
 
 The payload above is an Aftershock contract, not a DataHub event schema. The
 production ingress boundary is:
@@ -171,6 +243,10 @@ Before treating this as a live success, verify that the test ran rather than
 being skipped, that all MCP calls passed, and that the incident document is
 visible in the configured DataHub instance. Without those observations, only
 the offline and in-process protocol contracts have been verified.
+
+The opt-in live test validates seeded lineage/property discovery and
+`save_document`; it does not start the placeholder receiver or prove an
+external control outcome.
 
 ## Fixture mode reference
 

@@ -5,11 +5,13 @@ reads downstream lineage, resolves structured properties, invokes external
 controls, and writes a receipt document back to the graph. Four improvements
 would make this style of stateful agent workflow easier to build safely.
 
-First, I would value a more explicit pagination contract for `get_lineage`,
-with one documented response schema for `total`, `offset`, returned count, and
-continuation state, plus a reference loop that demonstrates the terminal page.
-I added fail-closed checks because an agent should not interpret an incomplete
-page as a complete blast radius.
+First, I would value a more explicit pagination and traversal contract for
+`get_lineage`, with one documented response schema for `total`, `offset`,
+returned count, and continuation state, plus a reference loop that demonstrates
+the terminal page. In the pinned MCP server, `max_hops=3` represents unlimited
+traversal; a named constant or clearer public parameter would prevent readers
+from interpreting it as a finite hop cap. I added fail-closed checks because an
+agent should not interpret an incomplete page as a complete blast radius.
 
 Second, structured-property reads would benefit from a typed helper that
 normalizes the nested definition, qualified name, cardinality, and typed value
@@ -29,6 +31,9 @@ Finally, I would like a typed remediation-playbook metadata concept rather than
 assembling operational configuration from unrelated strings. A useful schema
 could include the governed action identifier, endpoint reference, owning team,
 environment, credential reference (never the credential), timeout/retry policy,
-approval policy, dry-run support, and expected receipt schema. Exposing that
-metadata through MCP would help agents validate a playbook before taking action
-and leave a consistent result for later operators and agents.
+approval policy, dry-run support, expected terminal receipt schema, and an
+explicit network-policy binding. Exposing that metadata through MCP would help
+agents validate a playbook before taking action while still leaving exact URL
+authorization, DataHub property-write RBAC, and infrastructure egress under
+operator control. A standard external receipt ID field would also make it
+easier for later agents to reconcile accepted, failed, and unknown outcomes.
