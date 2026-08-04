@@ -1,11 +1,16 @@
 import asyncio
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 import pytest
 
-from compensating_action_engine import CompensatingActionEngine
+from compensating_action_engine import (
+    CompensatingActionEngine,
+    _HTTPX_REQUEST_URL_FILTER,
+    _install_httpx_request_log_filter,
+)
 from remediation_models import ActionableTarget, RemediationReceipt
 
 
@@ -64,6 +69,7 @@ def test_processes_success_failure_and_skips_as_structured_receipts(caplog) -> N
             return await engine.process_blast_radius(targets, "INC-9942")
 
     caplog.set_level(logging.INFO, logger="Aftershock-Engine")
+    caplog.set_level(logging.INFO, logger="httpx")
     receipts = asyncio.run(scenario())
 
     assert [receipt.status for receipt in receipts] == [
@@ -112,6 +118,14 @@ def test_processes_success_failure_and_skips_as_structured_receipts(caplog) -> N
 
     serialized = json.dumps([receipt.to_dict() for receipt in receipts])
     combined_output = serialized + caplog.text
+    assert (
+        'HTTP Request: POST https://remediation.example:8443/cancel '
+        '"HTTP/1.1 200 OK"'
+    ) in caplog.text
+    assert (
+        'HTTP Request: POST https://remediation.example/unavailable '
+        '"HTTP/1.1 503 Service Unavailable"'
+    ) in caplog.text
     for secret in (
         "api-user",
         "api-password",
@@ -248,3 +262,13 @@ def test_engine_closes_only_the_client_it_owns() -> None:
         return owned_closed, external_closed_by_engine
 
     assert asyncio.run(scenario()) == (True, False)
+
+
+def test_httpx_request_log_filter_installation_is_thread_safe_and_idempotent() -> None:
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        list(executor.map(lambda _: _install_httpx_request_log_filter(), range(64)))
+
+    assert sum(
+        installed_filter is _HTTPX_REQUEST_URL_FILTER
+        for installed_filter in logging.getLogger("httpx").filters
+    ) == 1

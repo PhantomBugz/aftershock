@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from collections.abc import Sequence
 from urllib.parse import urlsplit, urlunsplit
 
@@ -17,12 +18,46 @@ from remediation_models import (
 
 
 logger = logging.getLogger("Aftershock-Engine")
+_HTTPX_REQUEST_LOG_TEMPLATE = 'HTTP Request: %s %s "%s %d %s"'
+_HTTPX_REQUEST_LOG_FILTER_LOCK = threading.Lock()
+
+
+class _HttpxRequestURLFilter(logging.Filter):
+    """Sanitize only HTTPX's stable request-summary URL argument."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if (
+            record.name == "httpx"
+            and record.msg == _HTTPX_REQUEST_LOG_TEMPLATE
+            and isinstance(record.args, tuple)
+            and len(record.args) == 5
+        ):
+            arguments = list(record.args)
+            arguments[1] = (
+                _sanitize_endpoint(str(arguments[1]))
+                or "<invalid-remediation-endpoint>"
+            )
+            record.args = tuple(arguments)
+        return True
+
+
+_HTTPX_REQUEST_URL_FILTER = _HttpxRequestURLFilter()
+
+
+def _install_httpx_request_log_filter() -> None:
+    """Install the URL filter once without altering HTTPX logger policy."""
+
+    httpx_logger = logging.getLogger("httpx")
+    with _HTTPX_REQUEST_LOG_FILTER_LOCK:
+        if _HTTPX_REQUEST_URL_FILTER not in httpx_logger.filters:
+            httpx_logger.addFilter(_HTTPX_REQUEST_URL_FILTER)
 
 
 class CompensatingActionEngine:
     """Execute independent downstream controls without coupling their failures."""
 
     def __init__(self, http_client: httpx.AsyncClient | None = None) -> None:
+        _install_httpx_request_log_filter()
         self.http_client = http_client or httpx.AsyncClient(timeout=10.0)
         self._owns_client = http_client is None
 
