@@ -66,6 +66,25 @@ def _complete_entity(
     }
 
 
+def _single_lineage_page(
+    urn: str = DATA_JOB_URN,
+    entity_type: str = "DATA_JOB",
+) -> dict[int, dict[str, Any]]:
+    return {
+        0: {
+            "downstreams": {
+                "searchResults": [
+                    {"entity": {"urn": urn, "type": entity_type}}
+                ],
+                "total": 1,
+                "offset": 0,
+                "returned": 1,
+                "hasMore": False,
+            }
+        }
+    }
+
+
 def test_maps_batched_mcp_entities_by_urn_and_preserves_lineage_order() -> None:
     recorder = MCPCallRecorder(
         lineage_pages={
@@ -195,6 +214,63 @@ def test_preserves_nodes_when_details_are_missing_or_report_an_error() -> None:
             None,
             None,
         ),
+    ]
+
+
+@pytest.mark.parametrize("error_first", [False, True])
+def test_duplicate_valid_and_error_details_fail_closed_regardless_of_order(
+    error_first: bool,
+) -> None:
+    valid = _complete_entity(
+        DATA_JOB_URN,
+        "DATA_JOB",
+        "ISSUE_PO",
+        "https://api.internal.example/remediate/cancel_po",
+    )
+    error = {
+        "urn": DATA_JOB_URN,
+        "type": "DATA_FLOW",
+        "error": "detail lookup failed",
+    }
+    recorder = MCPCallRecorder(
+        lineage_pages=_single_lineage_page(),
+        entities_payload=[error, valid] if error_first else [valid, error]
+    )
+    context = MCPDataHubContext(client_factory=make_client_factory(recorder))
+
+    targets = asyncio.run(BlastRadiusMapper(context).get_targets(DATASET_URN))
+
+    assert targets == [
+        ActionableTarget(DATA_JOB_URN, "DATA_JOB", None, None),
+    ]
+
+
+@pytest.mark.parametrize("reverse_details", [False, True])
+def test_conflicting_duplicate_details_fail_closed_regardless_of_order(
+    reverse_details: bool,
+) -> None:
+    first = _complete_entity(
+        DATA_JOB_URN,
+        "DATA_JOB",
+        "ISSUE_PO",
+        "https://api.internal.example/remediate/cancel_po",
+    )
+    second = _complete_entity(
+        DATA_JOB_URN,
+        "DATA_FLOW",
+        "PAUSE_PIPELINE",
+        "https://api.internal.example/remediate/pause_pipeline",
+    )
+    recorder = MCPCallRecorder(
+        lineage_pages=_single_lineage_page(),
+        entities_payload=[second, first] if reverse_details else [first, second]
+    )
+    context = MCPDataHubContext(client_factory=make_client_factory(recorder))
+
+    targets = asyncio.run(BlastRadiusMapper(context).get_targets(DATASET_URN))
+
+    assert targets == [
+        ActionableTarget(DATA_JOB_URN, "DATA_JOB", None, None),
     ]
 
 

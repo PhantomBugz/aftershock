@@ -133,12 +133,20 @@ def _details_by_urn(
     details: Sequence[Mapping[str, Any]],
 ) -> dict[str, Mapping[str, Any]]:
     by_urn: dict[str, Mapping[str, Any]] = {}
+    ambiguous_urns: set[str] = set()
     for detail in details:
         if not isinstance(detail, Mapping):
             continue
         urn = detail.get("urn")
-        if isinstance(urn, str) and urn and urn not in by_urn:
-            by_urn[urn] = detail
+        if not isinstance(urn, str) or not urn or urn in ambiguous_urns:
+            continue
+        if urn in by_urn:
+            # The MCP contract expects one detail per requested URN. A duplicate
+            # cannot safely authorize either record's remediation endpoint.
+            del by_urn[urn]
+            ambiguous_urns.add(urn)
+            continue
+        by_urn[urn] = detail
     return by_urn
 
 
