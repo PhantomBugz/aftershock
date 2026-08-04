@@ -222,7 +222,7 @@ def _fixture_with_target(
     return FixtureDataHubContext(fixture_path)
 
 
-def test_dashboard_escapes_dynamic_values_and_marks_failed_control_as_issues(
+def test_dashboard_escapes_dynamic_values_and_marks_unknown_control_as_issues(
     tmp_path: Path,
 ) -> None:
     context = _fixture_with_target(
@@ -237,9 +237,9 @@ def test_dashboard_escapes_dynamic_values_and_marks_failed_control_as_issues(
         allowed_endpoints=("https://controls.example/fail",),
     )
 
-    assert report.receipts[0].status == "failed"
-    assert report.receipts[0].error == "remediation endpoint returned HTTP 503"
-    assert "remediation endpoint returned HTTP 503" in rendered
+    assert report.receipts[0].status == "outcome_unknown"
+    assert report.receipts[0].error == "remediation outcome unknown after dispatch"
+    assert "remediation outcome unknown after dispatch" in rendered
     assert "private failure body must not render" not in rendered
     assert "[bold red]UNTRUSTED[/]" in rendered
     assert "COMPLETED WITH ISSUES" in rendered

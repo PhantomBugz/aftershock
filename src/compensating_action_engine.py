@@ -30,12 +30,13 @@ _ALLOWLIST_ENV = "AFTERSHOCK_REMEDIATION_ALLOWLIST_JSON"
 _ALLOWLIST_ERROR = "invalid remediation endpoint allowlist configuration"
 _MAX_EXTERNAL_RECEIPT_ID_LENGTH = 256
 
-# Compensating-control response contract v1. A terminal success is proven only
-# by a non-202 2xx JSON object with these three top-level fields:
+# Compensating-control response contract v1. A terminal result is proven only
+# by a JSON object with these three top-level fields:
 #   {"receipt_version": 1, "status": "succeeded", "receipt_id": "..."}
 # ``receipt_id`` must be a nonblank, control-free string of at most 256 code
 # points. ``failed`` is terminal failure; ``accepted`` and ``pending`` are
-# explicitly nonterminal. Extra response fields are ignored and never logged.
+# explicitly nonterminal. HTTP 408 and 5xx remain ambiguous unless this
+# contract explicitly proves a terminal result. Extra fields are never logged.
 _V1_TERMINAL_STATUSES = frozenset({"succeeded", "failed"})
 _V1_NONTERMINAL_STATUSES = frozenset({"accepted", "pending"})
 
@@ -368,7 +369,8 @@ def _receipt_from_response(
     response: httpx.Response,
 ) -> RemediationReceipt:
     status_code = response.status_code
-    if not 200 <= status_code < 300:
+    ambiguous_http_status = status_code == 408 or 500 <= status_code < 600
+    if not 200 <= status_code < 300 and not ambiguous_http_status:
         logger.error(
             "Remediation control failed for target %s with HTTP %d",
             target.urn,
@@ -385,6 +387,23 @@ def _receipt_from_response(
 
     payload = _response_json_object(response)
     contract = _v1_contract(payload)
+    if ambiguous_http_status and (
+        contract is None or contract[0] not in _V1_TERMINAL_STATUSES
+    ):
+        logger.warning(
+            "Remediation outcome is unknown for target %s after HTTP %d",
+            target.urn,
+            status_code,
+        )
+        return _receipt(
+            target,
+            incident_id,
+            endpoint=endpoint,
+            status="outcome_unknown",
+            http_status=status_code,
+            error="remediation outcome unknown after dispatch",
+        )
+
     if status_code == 202:
         accepted_receipt_id = (
             contract[1]

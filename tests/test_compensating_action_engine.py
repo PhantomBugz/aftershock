@@ -245,8 +245,8 @@ def test_request_build_failure_is_failed_before_dispatch() -> None:
     assert receipt.error == "remediation request could not be prepared"
 
 
-@pytest.mark.parametrize("http_status", [400, 404, 429, 500, 503])
-def test_http_client_or_server_error_is_failed(http_status: int) -> None:
+@pytest.mark.parametrize("http_status", [400, 404, 429])
+def test_clear_http_client_rejection_is_failed(http_status: int) -> None:
     receipt = _run_one(
         httpx.Response(http_status, text="PRIVATE response body")
     )
@@ -255,6 +255,52 @@ def test_http_client_or_server_error_is_failed(http_status: int) -> None:
     assert receipt.http_status == http_status
     assert receipt.error == f"remediation endpoint returned HTTP {http_status}"
     assert "PRIVATE" not in json.dumps(receipt.to_dict())
+
+
+@pytest.mark.parametrize("http_status", [408, 500, 502, 503, 504])
+def test_ambiguous_http_error_without_terminal_receipt_is_outcome_unknown(
+    http_status: int,
+) -> None:
+    receipt = _run_one(
+        httpx.Response(http_status, text="PRIVATE response body")
+    )
+
+    assert receipt.status == "outcome_unknown"
+    assert receipt.http_status == http_status
+    assert receipt.external_receipt_id is None
+    assert receipt.error == "remediation outcome unknown after dispatch"
+    assert "PRIVATE" not in json.dumps(receipt.to_dict())
+
+
+@pytest.mark.parametrize(
+    ("http_status", "contract_status", "expected_status", "expected_error"),
+    [
+        (408, "succeeded", "succeeded", None),
+        (500, "failed", "failed", "remediation endpoint reported terminal failure"),
+        (503, "succeeded", "succeeded", None),
+    ],
+)
+def test_ambiguous_http_error_honors_valid_terminal_receipt(
+    http_status: int,
+    contract_status: str,
+    expected_status: str,
+    expected_error: str | None,
+) -> None:
+    receipt = _run_one(
+        httpx.Response(
+            http_status,
+            json={
+                "receipt_version": 1,
+                "status": contract_status,
+                "receipt_id": "receipt-ambiguous-1",
+            },
+        )
+    )
+
+    assert receipt.status == expected_status
+    assert receipt.http_status == http_status
+    assert receipt.external_receipt_id == "receipt-ambiguous-1"
+    assert receipt.error == expected_error
 
 
 def test_redirect_is_not_followed_and_is_reported_failed() -> None:

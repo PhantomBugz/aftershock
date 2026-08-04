@@ -218,7 +218,7 @@ def test_processes_mixed_controls_then_writes_one_complete_mcp_summary() -> None
     assert MODEL_URN in content
     assert SKIPPED_URN in content
     assert "succeeded" in content
-    assert "failed" in content
+    assert "outcome_unknown" in content
     assert "skipped" in content
     assert "External receipt ID" in content
     assert "control-succeed" in content
@@ -251,7 +251,7 @@ def test_processes_mixed_controls_then_writes_one_complete_mcp_summary() -> None
     )
     assert [receipt.status for receipt in report.receipts] == [
         "succeeded",
-        "failed",
+        "outcome_unknown",
         "skipped",
         "succeeded",
     ]
@@ -270,9 +270,9 @@ def test_processes_mixed_controls_then_writes_one_complete_mcp_summary() -> None
         "counts": {
             "succeeded": 2,
             "accepted": 0,
-            "failed": 1,
+            "failed": 0,
             "skipped": 1,
-            "outcome_unknown": 0,
+            "outcome_unknown": 1,
         },
         "receipts": [receipt.to_dict() for receipt in report.receipts],
         "writeback": {
