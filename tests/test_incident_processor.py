@@ -1,6 +1,7 @@
 import asyncio
 import json
 import re
+import unicodedata
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timezone
 from typing import Any
@@ -10,7 +11,7 @@ import pytest
 
 from compensating_action_engine import CompensatingActionEngine
 from datahub_context import DataHubMCPError, MCPDataHubContext
-from incident_processor import AftershockIncidentProcessor
+from incident_processor import AftershockIncidentProcessor, _single_line
 from remediation_models import IncidentReport, WriteBackReceipt
 from mcp_test_server import (
     DATASET_URN,
@@ -126,6 +127,19 @@ def _run_processor(
             return await processor.process(incident_id, dataset_urn)
 
     return asyncio.run(scenario())
+
+
+def test_title_normalization_removes_all_unicode_control_categories() -> None:
+    raw = " INC\x00 99\u202e\ud800\x1ftail "
+
+    normalized = _single_line(raw)
+
+    assert normalized == "INC 99 tail"
+    assert all(
+        not unicodedata.category(character).startswith("C")
+        for character in normalized
+    )
+    assert _single_line("\x00\u202e\ud800") == "unnamed"
 
 
 def test_processes_mixed_controls_then_writes_one_complete_mcp_summary() -> None:
@@ -254,7 +268,7 @@ def test_zero_target_incidents_are_written_and_retry_urns_are_safe_and_stable() 
     async def handler(_: httpx.Request) -> httpx.Response:
         raise AssertionError("zero-target incidents must not call HTTP controls")
 
-    malicious_id = " INC 99|42\r\ncontrol?! "
+    malicious_id = " INC\x00 99|42\r\n\u202e\ud800control?! "
     first = _run_processor(recorder, handler, incident_id=malicious_id)
     second = _run_processor(recorder, handler, incident_id=malicious_id)
     third = _run_processor(recorder, handler, incident_id="INC 99-43")
@@ -269,6 +283,10 @@ def test_zero_target_incidents_are_written_and_retry_urns_are_safe_and_stable() 
     )
     assert "\n" not in save_calls[0]["title"]
     assert "\r" not in save_calls[0]["title"]
+    assert all(
+        not unicodedata.category(character).startswith("C")
+        for character in save_calls[0]["title"]
+    )
     assert save_calls[0]["related_assets"] == [DATASET_URN]
     assert "No downstream remediation targets were found." in save_calls[0]["content"]
     assert first.receipts == second.receipts == third.receipts == ()

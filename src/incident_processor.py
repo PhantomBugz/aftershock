@@ -144,7 +144,10 @@ def _saved_document_urn(result: object, *, expected_urn: str) -> str:
 def _single_line(value: object) -> str:
     """Collapse newlines and controls for titles without interpreting markup."""
 
-    text = str(value)
+    text = "".join(
+        " " if unicodedata.category(character).startswith("C") else character
+        for character in str(value)
+    )
     return " ".join(text.split()) or "unnamed"
 
 
