@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import re
 from concurrent.futures import ThreadPoolExecutor
 
 import httpx
@@ -262,6 +263,39 @@ def test_engine_closes_only_the_client_it_owns() -> None:
         return owned_closed, external_closed_by_engine
 
     assert asyncio.run(scenario()) == (True, False)
+
+
+def test_downstream_idempotency_key_is_stable_and_scoped_without_deduping() -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200)
+
+    async def scenario() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), timeout=10.0
+        ) as client:
+            engine = CompensatingActionEngine(http_client=client)
+            first_target = _target("stable", action="PAUSE_JOB")
+            await engine.execute_rollback(first_target, "INC-RETRY")
+            await engine.execute_rollback(first_target, "INC-RETRY")
+            await engine.execute_rollback(first_target, "INC-DIFFERENT")
+            await engine.execute_rollback(
+                _target("different-target", action="PAUSE_JOB"), "INC-RETRY"
+            )
+
+    asyncio.run(scenario())
+
+    assert len(requests) == 4
+    keys = [request.headers["Idempotency-Key"] for request in requests]
+    assert keys[0] == keys[1]
+    assert keys[0] != keys[2]
+    assert keys[0] != keys[3]
+    assert len(set(keys)) == 3
+    assert all(re.fullmatch(r"aftershock-[0-9a-f]{64}", key) for key in keys)
+    assert requests[0].url == requests[1].url
+    assert requests[0].content == requests[1].content
 
 
 def test_httpx_request_log_filter_installation_is_thread_safe_and_idempotent() -> None:

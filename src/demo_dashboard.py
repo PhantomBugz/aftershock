@@ -52,6 +52,7 @@ def _receipt_table(report: IncidentReport) -> Table:
     table.add_column("Status")
     table.add_column("HTTP")
     table.add_column("Endpoint")
+    table.add_column("Error")
     for receipt in report.receipts:
         table.add_row(
             _safe(receipt.entity_type),
@@ -59,6 +60,7 @@ def _receipt_table(report: IncidentReport) -> Table:
             _safe(receipt.status),
             _safe(receipt.http_status),
             _safe(receipt.endpoint),
+            _safe(receipt.error),
         )
     return table
 
@@ -125,9 +127,11 @@ async def run_demo(
 
     qualifier = " (fixture response)" if fixture_mode else " (configured MCP)"
     active_console.print(
-        "[bold yellow]ACT 2  //  DATAHUB CONTEXT AND BLAST RADIUS[/]\n"
+        "[bold yellow]ACT 2  //  FULL WORKFLOW EXECUTION[/]\n"
         f"Context read contract: [bold]get_lineage(upstream=false)[/]"
-        f"{qualifier}"
+        f"{qualifier}\n"
+        "This step performs lineage discovery, control processing, and the "
+        "incident-record write-back."
     )
 
     async def process(client: httpx.AsyncClient) -> IncidentReport:
@@ -143,7 +147,10 @@ async def run_demo(
             console=active_console,
             transient=False,
         ) as progress:
-            task_id = progress.add_task("Executing incident processor...", total=1)
+            task_id = progress.add_task(
+                "Executing full workflow: lineage + controls + save_document...",
+                total=1,
+            )
             report = await processor.process(DEMO_INCIDENT_ID, DEMO_DATASET_URN)
             progress.update(task_id, completed=1)
         return report
@@ -164,17 +171,23 @@ async def run_demo(
     active_console.print(
         Panel(
             _build_blast_radius_tree(report),
-            subtitle="[dim]Typed downstream entities returned by the workflow[/]",
+            title="[bold yellow]RECORDED BLAST-RADIUS VIEW[/]",
+            subtitle="[dim]Retrospective view from the completed workflow receipts[/]",
             border_style="yellow",
         )
     )
     await _pause(delay)
 
-    active_console.print("[bold bright_cyan]ACT 3  //  CONTROL RECEIPTS[/]")
+    active_console.print(
+        "[bold bright_cyan]ACT 3  //  RECORDED CONTROL RECEIPTS[/]\n"
+        "Control processing occurred during the full workflow above; this is a "
+        "retrospective receipt view."
+    )
     active_console.print(_receipt_table(report))
     for index, receipt in enumerate(report.receipts, start=1):
         active_console.print(
-            f"Receipt {index} endpoint: {_safe(receipt.endpoint)}"
+            f"Receipt {index} endpoint: {_safe(receipt.endpoint)}\n"
+            f"Receipt {index} error: {_safe(receipt.error)}"
         )
     await _pause(delay)
 
@@ -182,7 +195,7 @@ async def run_demo(
         " (in-memory fixture recorder)" if fixture_mode else " (MCP save_document receipt)"
     )
     active_console.print(
-        f"Write-back status: [bold]{_safe(report.writeback.status)}[/]"
+        f"Recorded write-back status: [bold]{_safe(report.writeback.status)}[/]"
         f"{writeback_note}\n"
         f"Saved document URN: {_safe(report.writeback.document_urn)}"
     )

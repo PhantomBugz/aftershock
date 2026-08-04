@@ -100,12 +100,20 @@ def test_dashboard_runs_processor_records_fixture_document_and_displays_report()
     assert "ML_MODEL" in rendered
     assert "ISSUE_PO" in rendered
     assert "ADJUST_PRICE" in rendered
-    assert "Executing incident processor" in rendered
+    assert "Executing full workflow: lineage + controls + save_document" in rendered
+    assert "RECORDED BLAST-RADIUS VIEW" in rendered
+    assert "ACT 3  //  RECORDED CONTROL RECEIPTS" in rendered
+    assert (
+        "Control processing occurred during the full workflow above; this is a "
+        "retrospective receipt view."
+    ) in rendered
+    assert "Executing incident processor" not in rendered
+    assert "Executing Compensating Controls" not in rendered
     for receipt in report.receipts:
         assert receipt.status in rendered
         assert str(receipt.http_status) in rendered
         assert receipt.endpoint in rendered
-    assert "Write-back status: succeeded" in rendered
+    assert "Recorded write-back status: succeeded" in rendered
     assert report.writeback.document_urn in rendered
     assert "in-memory fixture recorder" in rendered
     assert "COMPLETED: all discovered controls succeeded and the incident record was saved" in rendered
@@ -179,9 +187,15 @@ def test_dashboard_escapes_dynamic_values_and_marks_failed_control_as_issues(
         webhook="https://controls.example/fail",
     )
 
-    report, rendered = _run(context, lambda _: httpx.Response(503))
+    report, rendered = _run(
+        context,
+        lambda _: httpx.Response(503, text="private failure body must not render"),
+    )
 
     assert report.receipts[0].status == "failed"
+    assert report.receipts[0].error == "remediation endpoint returned HTTP 503"
+    assert "remediation endpoint returned HTTP 503" in rendered
+    assert "private failure body must not render" not in rendered
     assert "[bold red]UNTRUSTED[/]" in rendered
     assert "COMPLETED WITH ISSUES" in rendered
     assert "all discovered controls succeeded" not in rendered
@@ -198,6 +212,8 @@ def test_dashboard_marks_skipped_control_as_completed_with_issues(
     report, rendered = _run(context, forbidden)
 
     assert report.receipts[0].status == "skipped"
+    assert report.receipts[0].error == "missing remediation webhook"
+    assert "missing remediation webhook" in rendered
     assert "COMPLETED WITH ISSUES" in rendered
     assert "all discovered controls succeeded" not in rendered
 
@@ -214,7 +230,7 @@ def test_dashboard_marks_writeback_failure_as_completed_with_issues() -> None:
 
     assert all(receipt.status == "succeeded" for receipt in report.receipts)
     assert report.writeback.status == "failed"
-    assert "Write-back status: failed" in rendered
+    assert "Recorded write-back status: failed" in rendered
     assert "COMPLETED WITH ISSUES" in rendered
     assert "writeback secret" not in rendered
     assert "all discovered controls succeeded" not in rendered

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import threading
 from collections.abc import Sequence
@@ -112,7 +113,13 @@ class CompensatingActionEngine:
             # query-routed webhooks retain their semantics. This module never
             # logs it and persists only the sanitized endpoint above.
             response = await self.http_client.post(
-                target.remediation_webhook, json=payload
+                target.remediation_webhook,
+                json=payload,
+                headers={
+                    "Idempotency-Key": _idempotency_key(
+                        incident_id, target.urn, target.business_action
+                    )
+                },
             )
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
@@ -229,6 +236,19 @@ def _sanitize_endpoint(raw_url: str | None) -> str | None:
     safe_host = f"[{hostname}]" if ":" in hostname else hostname
     netloc = f"{safe_host}:{port}" if port is not None else safe_host
     return urlunsplit((scheme, netloc, parts.path, "", ""))
+
+
+def _idempotency_key(
+    incident_id: str, target_urn: str, business_action: str
+) -> str:
+    """Derive a stable opaque key for a downstream service's retry contract."""
+
+    digest = hashlib.sha256()
+    for value in (incident_id, target_urn, business_action):
+        encoded = value.encode("utf-8", errors="surrogatepass")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    return f"aftershock-{digest.hexdigest()}"
 
 
 def _receipt(

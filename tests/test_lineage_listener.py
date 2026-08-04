@@ -8,9 +8,13 @@ import pytest
 from fastapi.testclient import TestClient
 
 from compensating_action_engine import CompensatingActionEngine
-from datahub_context import MCPDataHubContext
+from datahub_context import FixtureDataHubContext, MCPDataHubContext
 from incident_processor import AftershockIncidentProcessor, _incident_document_urn
-from lineage_listener import app, get_processor_session_factory
+from lineage_listener import (
+    app,
+    get_critical_authenticator,
+    get_processor_session_factory,
+)
 from mcp_test_server import (
     DATASET_URN,
     DATA_JOB_URN,
@@ -22,6 +26,11 @@ from mcp_test_server import (
 
 FIXED_NOW = datetime(2026, 8, 4, 15, 16, 17, tzinfo=timezone.utc)
 SAFE_FAILURE = {"detail": "Aftershock incident processing unavailable"}
+SAFE_AUTH_CONFIG_FAILURE = {
+    "detail": "Aftershock critical authentication unavailable"
+}
+SAFE_UNAUTHORIZED = {"detail": "Unauthorized critical incident request"}
+TEST_WEBHOOK_TOKEN = "test-aftershock-webhook-token"
 
 
 def _property(qualified_name: str, value: str) -> dict[str, Any]:
@@ -84,12 +93,20 @@ def _critical_recorder() -> MCPCallRecorder:
     )
 
 
-def _post(payload: dict[str, object]) -> httpx.Response:
+def _post(
+    payload: dict[str, object], *, authorization: str | None = None
+) -> httpx.Response:
+    headers = (
+        {"Authorization": authorization} if authorization is not None else None
+    )
     with TestClient(app) as client:
-        return client.post("/webhook/datahub", json=payload)
+        return client.post("/webhook/datahub", json=payload, headers=headers)
 
 
-def test_critical_envelope_runs_real_mcp_processor_and_returns_report() -> None:
+def test_critical_envelope_runs_real_mcp_processor_and_returns_report(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("AFTERSHOCK_WEBHOOK_TOKEN", TEST_WEBHOOK_TOKEN)
     recorder = _critical_recorder()
     requests: list[httpx.Request] = []
 
@@ -117,7 +134,8 @@ def test_critical_envelope_runs_real_mcp_processor_and_returns_report() -> None:
                 "incident_id": "  INC-9942  ",
                 "dataset_urn": f"  {DATASET_URN}  ",
                 "severity": " critical ",
-            }
+            },
+            authorization=f"Bearer {TEST_WEBHOOK_TOKEN}",
         )
     finally:
         app.dependency_overrides.clear()
@@ -129,6 +147,7 @@ def test_critical_envelope_runs_real_mcp_processor_and_returns_report() -> None:
     assert body["incident_id"] == "INC-9942"
     assert body["dataset_urn"] == DATASET_URN
     assert body["context_mode"] == "mcp"
+    assert body["execution_mode"] == "DATAHUB MCP MODE"
     assert body["counts"] == {"succeeded": 2, "failed": 0, "skipped": 0}
     assert [receipt["status"] for receipt in body["receipts"]] == [
         "succeeded",
@@ -161,8 +180,12 @@ def test_critical_envelope_runs_real_mcp_processor_and_returns_report() -> None:
     }
 
 
-def test_noncritical_envelope_is_ignored_without_entering_processor_session() -> None:
+def test_noncritical_envelope_is_ignored_without_context_or_authentication(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("AFTERSHOCK_WEBHOOK_TOKEN", raising=False)
     entered = False
+    authenticated = False
 
     @asynccontextmanager
     async def forbidden_session():
@@ -174,6 +197,14 @@ def test_noncritical_envelope_is_ignored_without_entering_processor_session() ->
     app.dependency_overrides[get_processor_session_factory] = (
         lambda: forbidden_session
     )
+    app.dependency_overrides[get_critical_authenticator] = lambda: (
+        lambda _: _mark_authenticated()
+    )
+
+    def _mark_authenticated() -> None:
+        nonlocal authenticated
+        authenticated = True
+
     try:
         response = _post(
             {
@@ -192,9 +223,11 @@ def test_noncritical_envelope_is_ignored_without_entering_processor_session() ->
         "message": "no action required",
     }
     assert entered is False
+    assert authenticated is False
 
 
-def test_mcp_failure_returns_fixed_secret_safe_service_error() -> None:
+def test_mcp_failure_returns_fixed_secret_safe_service_error(monkeypatch) -> None:
+    monkeypatch.setenv("AFTERSHOCK_WEBHOOK_TOKEN", TEST_WEBHOOK_TOKEN)
     recorder = _critical_recorder()
     recorder.fail_tool = "get_lineage"
     recorder.failure_message = "server leaked TOP-SECRET-MCP-TOKEN"
@@ -218,7 +251,8 @@ def test_mcp_failure_returns_fixed_secret_safe_service_error() -> None:
                 "incident_id": "INC-FAIL",
                 "dataset_urn": DATASET_URN,
                 "severity": "CRITICAL",
-            }
+            },
+            authorization=f"Bearer {TEST_WEBHOOK_TOKEN}",
         )
     finally:
         app.dependency_overrides.clear()
@@ -227,6 +261,122 @@ def test_mcp_failure_returns_fixed_secret_safe_service_error() -> None:
     assert response.json() == SAFE_FAILURE
     assert "TOP-SECRET-MCP-TOKEN" not in response.text
     assert recorder.events == ["get_lineage"]
+
+
+@pytest.mark.parametrize("configured_token", [None, "   "])
+def test_critical_auth_configuration_failure_is_fixed_and_opens_no_session(
+    monkeypatch, configured_token: str | None
+) -> None:
+    if configured_token is None:
+        monkeypatch.delenv("AFTERSHOCK_WEBHOOK_TOKEN", raising=False)
+    else:
+        monkeypatch.setenv("AFTERSHOCK_WEBHOOK_TOKEN", configured_token)
+    entered = False
+
+    @asynccontextmanager
+    async def forbidden_session():
+        nonlocal entered
+        entered = True
+        raise AssertionError("authentication must precede processor setup")
+        yield  # pragma: no cover
+
+    app.dependency_overrides[get_processor_session_factory] = (
+        lambda: forbidden_session
+    )
+    try:
+        response = _post(
+            {
+                "incident_id": "INC-AUTH-CONFIG",
+                "dataset_urn": DATASET_URN,
+                "severity": "CRITICAL",
+            },
+            authorization="Bearer request-secret-that-must-not-leak",
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 503
+    assert response.json() == SAFE_AUTH_CONFIG_FAILURE
+    assert "request-secret-that-must-not-leak" not in response.text
+    assert entered is False
+
+
+@pytest.mark.parametrize(
+    "authorization",
+    [
+        None,
+        "Bearer wrong-secret-that-must-not-leak",
+        "Basic test-aftershock-webhook-token",
+        "Bearer",
+        "Bearer test-aftershock-webhook-token extra",
+    ],
+)
+def test_missing_or_invalid_critical_auth_is_fixed_and_opens_no_session(
+    monkeypatch, authorization: str | None
+) -> None:
+    monkeypatch.setenv("AFTERSHOCK_WEBHOOK_TOKEN", TEST_WEBHOOK_TOKEN)
+    entered = False
+
+    @asynccontextmanager
+    async def forbidden_session():
+        nonlocal entered
+        entered = True
+        raise AssertionError("authentication must precede processor setup")
+        yield  # pragma: no cover
+
+    app.dependency_overrides[get_processor_session_factory] = (
+        lambda: forbidden_session
+    )
+    try:
+        response = _post(
+            {
+                "incident_id": "INC-UNAUTHORIZED",
+                "dataset_urn": DATASET_URN,
+                "severity": "CRITICAL",
+            },
+            authorization=authorization,
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 401
+    assert response.json() == SAFE_UNAUTHORIZED
+    assert "wrong-secret-that-must-not-leak" not in response.text
+    assert TEST_WEBHOOK_TOKEN not in response.text
+    assert entered is False
+
+
+def test_critical_fixture_response_is_unmistakably_labeled(monkeypatch) -> None:
+    monkeypatch.setenv("AFTERSHOCK_WEBHOOK_TOKEN", TEST_WEBHOOK_TOKEN)
+    context = FixtureDataHubContext()
+
+    @asynccontextmanager
+    async def session():
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda _: httpx.Response(200))
+        ) as http_client:
+            yield AftershockIncidentProcessor(
+                context,
+                CompensatingActionEngine(http_client=http_client),
+                clock=lambda: FIXED_NOW,
+            )
+
+    app.dependency_overrides[get_processor_session_factory] = lambda: session
+    try:
+        response = _post(
+            {
+                "incident_id": "INC-FIXTURE",
+                "dataset_urn": DATASET_URN,
+                "severity": "CRITICAL",
+            },
+            authorization=f"Bearer {TEST_WEBHOOK_TOKEN}",
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json()["context_mode"] == "fixture"
+    assert response.json()["execution_mode"] == "OFFLINE FIXTURE MODE"
 
 
 @pytest.mark.parametrize(

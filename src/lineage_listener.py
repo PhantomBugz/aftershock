@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import logging
+import os
+import secrets
 from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from blast_radius_mapper import BlastRadiusMappingError
@@ -25,9 +27,20 @@ logger = logging.getLogger("Aftershock-Listener")
 app = FastAPI(title="Aftershock Incident Listener", version="0.2.0")
 _DATASET_URN_PREFIX = "urn:li:dataset:"
 _PROCESSING_UNAVAILABLE = "Aftershock incident processing unavailable"
+_AUTHENTICATION_UNAVAILABLE = "Aftershock critical authentication unavailable"
+_UNAUTHORIZED = "Unauthorized critical incident request"
 
 ProcessorSession = AbstractAsyncContextManager[AftershockIncidentProcessor]
 ProcessorSessionFactory = Callable[[], ProcessorSession]
+CriticalAuthenticator = Callable[[str | None], None]
+
+
+class _CriticalAuthConfigurationError(RuntimeError):
+    """Critical authentication cannot run because no secret is configured."""
+
+
+class _CriticalAuthenticationError(RuntimeError):
+    """The caller did not provide the configured bearer credential."""
 
 
 class AftershockIncidentEnvelope(BaseModel):
@@ -66,6 +79,28 @@ def get_processor_session_factory() -> ProcessorSessionFactory:
     return _default_processor_session
 
 
+def _authenticate_critical_request(authorization: str | None) -> None:
+    configured = os.environ.get("AFTERSHOCK_WEBHOOK_TOKEN")
+    if configured is None or not configured.strip():
+        raise _CriticalAuthConfigurationError
+    expected = configured.strip()
+
+    parts = authorization.split() if authorization is not None else []
+    if len(parts) != 2 or parts[0].casefold() != "bearer":
+        raise _CriticalAuthenticationError
+    candidate = parts[1]
+    if not secrets.compare_digest(
+        candidate.encode("utf-8"), expected.encode("utf-8")
+    ):
+        raise _CriticalAuthenticationError
+
+
+def get_critical_authenticator() -> CriticalAuthenticator:
+    """Provide lazy critical-request authentication without reading config."""
+
+    return _authenticate_critical_request
+
+
 def _workflow_completed(processor_report: IncidentReport) -> bool:
     return (
         all(receipt.status == "succeeded" for receipt in processor_report.receipts)
@@ -79,6 +114,12 @@ async def receive_aftershock_incident(
     session_factory: Annotated[
         ProcessorSessionFactory, Depends(get_processor_session_factory)
     ],
+    critical_authenticator: Annotated[
+        CriticalAuthenticator, Depends(get_critical_authenticator)
+    ],
+    authorization: Annotated[
+        str | None, Header(alias="Authorization")
+    ] = None,
 ) -> dict[str, object]:
     """Process one normalized incident fully, including DataHub write-back."""
 
@@ -88,6 +129,20 @@ async def receive_aftershock_incident(
             "incident_id": incident.incident_id,
             "message": "no action required",
         }
+
+    try:
+        critical_authenticator(authorization)
+    except _CriticalAuthConfigurationError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=_AUTHENTICATION_UNAVAILABLE,
+        ) from None
+    except _CriticalAuthenticationError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=_UNAUTHORIZED,
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from None
 
     try:
         async with session_factory() as processor:
@@ -111,6 +166,11 @@ async def receive_aftershock_incident(
     return {
         "status": (
             "completed" if _workflow_completed(report) else "completed_with_issues"
+        ),
+        "execution_mode": (
+            "OFFLINE FIXTURE MODE"
+            if report.context_mode == "fixture"
+            else "DATAHUB MCP MODE"
         ),
         **response,
     }
