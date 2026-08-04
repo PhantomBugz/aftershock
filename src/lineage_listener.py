@@ -13,7 +13,11 @@ from fastapi import Depends, FastAPI, Header, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from blast_radius_mapper import BlastRadiusMappingError
-from compensating_action_engine import CompensatingActionEngine
+from compensating_action_engine import (
+    CompensatingActionEngine,
+    RemediationConfigurationError,
+    build_remediation_allowlist_from_env,
+)
 from datahub_context import (
     DataHubConfigurationError,
     DataHubMCPError,
@@ -65,8 +69,9 @@ class AftershockIncidentEnvelope(BaseModel):
 async def _default_processor_session() -> AsyncIterator[AftershockIncidentProcessor]:
     """Build and close one live or explicitly configured fixture session."""
 
+    allowed_endpoints = build_remediation_allowlist_from_env()
     context = build_datahub_context_from_env()
-    engine = CompensatingActionEngine()
+    engine = CompensatingActionEngine(allowed_endpoints=allowed_endpoints)
     try:
         yield AftershockIncidentProcessor(context, engine)
     finally:
@@ -153,6 +158,7 @@ async def receive_aftershock_incident(
         DataHubConfigurationError,
         DataHubMCPError,
         BlastRadiusMappingError,
+        RemediationConfigurationError,
     ):
         # Tool details can contain server responses or secrets. Log and return
         # only a controlled message, and never switch to fixture data.

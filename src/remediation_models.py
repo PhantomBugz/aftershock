@@ -6,7 +6,13 @@ from dataclasses import asdict, dataclass
 from typing import Literal
 
 
-RemediationStatus = Literal["succeeded", "failed", "skipped"]
+RemediationStatus = Literal[
+    "succeeded",
+    "accepted",
+    "failed",
+    "skipped",
+    "outcome_unknown",
+]
 WriteBackStatus = Literal["succeeded", "failed"]
 
 
@@ -36,6 +42,7 @@ class RemediationReceipt:
     endpoint: str | None
     status: RemediationStatus
     http_status: int | None
+    external_receipt_id: str | None
     error: str | None
 
     def to_dict(self) -> dict[str, object]:
@@ -78,7 +85,13 @@ class IncidentReport:
 
         counts = {
             status: sum(receipt.status == status for receipt in self.receipts)
-            for status in ("succeeded", "failed", "skipped")
+            for status in (
+                "succeeded",
+                "accepted",
+                "failed",
+                "skipped",
+                "outcome_unknown",
+            )
         }
         return {
             "incident_id": self.incident_id,

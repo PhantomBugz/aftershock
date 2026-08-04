@@ -93,7 +93,7 @@ def _recorder_with_mixed_targets() -> MCPCallRecorder:
                 action=(
                     "ADJUST|PRICE\nNOW <script>`code` [link](x) *bold*"
                 ),
-                webhook="https://controls.example/fail#private-fragment",
+                webhook="https://controls.example/fail?token=private-fragment",
             ),
             _entity(SKIPPED_URN, "DATA_JOB", action="AUDIT_ONLY"),
         ],
@@ -114,6 +114,19 @@ def _run_processor(
     incident_id: str = "INC-9942",
     dataset_urn: str = DATASET_URN,
 ) -> IncidentReport:
+    allowed_endpoints: list[str] = []
+    for entity in recorder.entities_payload or []:
+        properties = entity.get("structuredProperties", {}).get("properties", [])
+        for property_value in properties:
+            definition = property_value.get("structuredProperty", {}).get(
+                "definition", {}
+            )
+            if definition.get("qualifiedName") != "aftershock.remediationWebhook":
+                continue
+            values = property_value.get("values", [])
+            if values and isinstance(values[0].get("stringValue"), str):
+                allowed_endpoints.append(values[0]["stringValue"])
+
     async def scenario() -> IncidentReport:
         context = MCPDataHubContext(client_factory=make_client_factory(recorder))
         async with httpx.AsyncClient(
@@ -121,7 +134,10 @@ def _run_processor(
         ) as client:
             processor = AftershockIncidentProcessor(
                 context,
-                CompensatingActionEngine(http_client=client),
+                CompensatingActionEngine(
+                    http_client=client,
+                    allowed_endpoints=allowed_endpoints,
+                ),
                 clock=lambda: FIXED_NOW,
             )
             return await processor.process(incident_id, dataset_urn)
@@ -151,7 +167,14 @@ def test_processes_mixed_controls_then_writes_one_complete_mcp_summary() -> None
         recorder.events.append(f"http:{request.url.path}")
         if request.url.path == "/fail":
             return httpx.Response(503, text="private body")
-        return httpx.Response(202, json={"accepted": True})
+        return httpx.Response(
+            200,
+            json={
+                "receipt_version": 1,
+                "status": "succeeded",
+                "receipt_id": f"control{request.url.path.replace('/', '-')}",
+            },
+        )
 
     report = _run_processor(recorder, handler)
 
@@ -197,6 +220,8 @@ def test_processes_mixed_controls_then_writes_one_complete_mcp_summary() -> None
     assert "succeeded" in content
     assert "failed" in content
     assert "skipped" in content
+    assert "External receipt ID" in content
+    assert "control-succeed" in content
     assert (
         "ADJUST\\|PRICE<br>NOW &lt;script&gt;&#96;code&#96; "
         "\\[link\\](x) \\*bold\\*"
@@ -230,13 +255,25 @@ def test_processes_mixed_controls_then_writes_one_complete_mcp_summary() -> None
         "skipped",
         "succeeded",
     ]
+    assert [receipt.external_receipt_id for receipt in report.receipts] == [
+        "control-succeed",
+        None,
+        None,
+        "control-succeed",
+    ]
     assert isinstance(report.receipts, tuple)
     assert report.to_dict() == {
         "incident_id": "INC-9942",
         "dataset_urn": DATASET_URN,
         "context_mode": "mcp",
         "timestamp": FIXED_TIMESTAMP,
-        "counts": {"succeeded": 2, "failed": 1, "skipped": 1},
+        "counts": {
+            "succeeded": 2,
+            "accepted": 0,
+            "failed": 1,
+            "skipped": 1,
+            "outcome_unknown": 0,
+        },
         "receipts": [receipt.to_dict() for receipt in report.receipts],
         "writeback": {
             "status": "succeeded",
@@ -292,8 +329,10 @@ def test_zero_target_incidents_are_written_and_retry_urns_are_safe_and_stable() 
     assert first.receipts == second.receipts == third.receipts == ()
     assert first.to_dict()["counts"] == {
         "succeeded": 0,
+        "accepted": 0,
         "failed": 0,
         "skipped": 0,
+        "outcome_unknown": 0,
     }
     assert first.writeback.status == "succeeded"
     assert [name for name, _ in recorder.calls].count("get_entities") == 0
@@ -336,7 +375,14 @@ def test_writeback_failures_are_secret_safe_and_preserve_control_receipts(
 
     async def handler(request: httpx.Request) -> httpx.Response:
         recorder.events.append(f"http:{request.url.path}")
-        return httpx.Response(200)
+        return httpx.Response(
+            200,
+            json={
+                "receipt_version": 1,
+                "status": "succeeded",
+                "receipt_id": "writeback-test-control",
+            },
+        )
 
     report = _run_processor(recorder, handler)
 

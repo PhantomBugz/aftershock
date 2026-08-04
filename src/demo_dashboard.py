@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from datetime import datetime
 
 import httpx
@@ -24,6 +24,10 @@ DEMO_DATASET_URN = (
     "urn:li:dataset:(urn:li:dataPlatform:postgres,inventory_pricing,PROD)"
 )
 DEMO_INCIDENT_ID = "INC-9942"
+DEMO_FIXTURE_ENDPOINTS = (
+    "https://api.internal.example/remediate/cancel_po",
+    "https://api.internal.example/remediate/revert_pricing",
+)
 Clock = Callable[[], datetime]
 
 
@@ -51,6 +55,7 @@ def _receipt_table(report: IncidentReport) -> Table:
     table.add_column("Target / action")
     table.add_column("Status")
     table.add_column("HTTP")
+    table.add_column("External receipt ID")
     table.add_column("Endpoint")
     table.add_column("Error")
     for receipt in report.receipts:
@@ -59,6 +64,7 @@ def _receipt_table(report: IncidentReport) -> Table:
             f"{_safe(receipt.target_urn)}\n{_safe(receipt.business_action)}",
             _safe(receipt.status),
             _safe(receipt.http_status),
+            _safe(receipt.external_receipt_id),
             _safe(receipt.endpoint),
             _safe(receipt.error),
         )
@@ -82,6 +88,7 @@ async def run_demo(
     console: Console | None = None,
     context: DataHubContextPort | None = None,
     http_client: httpx.AsyncClient | None = None,
+    remediation_allowlist: Collection[str] | None = None,
     clock: Clock | None = None,
     delay: float = 1.5,
 ) -> IncidentReport:
@@ -92,6 +99,14 @@ async def run_demo(
     fixture_mode = active_context.mode == "fixture"
     if not fixture_mode and http_client is None:
         raise ValueError("http_client is required for non-fixture context")
+    if remediation_allowlist is None:
+        if not fixture_mode:
+            raise ValueError(
+                "remediation_allowlist is required for non-fixture context"
+            )
+        active_allowlist = DEMO_FIXTURE_ENDPOINTS
+    else:
+        active_allowlist = tuple(remediation_allowlist)
 
     if fixture_mode:
         active_console.print(
@@ -137,7 +152,10 @@ async def run_demo(
     async def process(client: httpx.AsyncClient) -> IncidentReport:
         processor = AftershockIncidentProcessor(
             active_context,
-            CompensatingActionEngine(http_client=client),
+            CompensatingActionEngine(
+                http_client=client,
+                allowed_endpoints=active_allowlist,
+            ),
             clock=clock,
         )
         with Progress(
@@ -159,9 +177,17 @@ async def run_demo(
         report = await process(http_client)
     else:
 
-        async def fixture_remediation(_: httpx.Request) -> httpx.Response:
+        async def fixture_remediation(request: httpx.Request) -> httpx.Response:
             await asyncio.sleep(0.05)
-            return httpx.Response(200, json={"accepted": True})
+            receipt_name = request.url.path.rsplit("/", 1)[-1] or "control"
+            return httpx.Response(
+                200,
+                json={
+                    "receipt_version": 1,
+                    "status": "succeeded",
+                    "receipt_id": f"fixture-receipt-{receipt_name}",
+                },
+            )
 
         async with httpx.AsyncClient(
             transport=httpx.MockTransport(fixture_remediation), timeout=10.0
@@ -187,6 +213,8 @@ async def run_demo(
     for index, receipt in enumerate(report.receipts, start=1):
         active_console.print(
             f"Receipt {index} endpoint: {_safe(receipt.endpoint)}\n"
+            f"Receipt {index} external receipt ID: "
+            f"{_safe(receipt.external_receipt_id)}\n"
             f"Receipt {index} error: {_safe(receipt.error)}"
         )
     await _pause(delay)

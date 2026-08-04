@@ -9,10 +9,20 @@ import pytest
 
 from compensating_action_engine import (
     CompensatingActionEngine,
+    RemediationConfigurationError,
     _HTTPX_REQUEST_URL_FILTER,
     _install_httpx_request_log_filter,
+    build_remediation_allowlist_from_env,
+    parse_remediation_allowlist_json,
 )
 from remediation_models import ActionableTarget, RemediationReceipt
+
+
+TERMINAL_SUCCESS = {
+    "receipt_version": 1,
+    "status": "succeeded",
+    "receipt_id": "receipt-001",
+}
 
 
 def _target(
@@ -29,234 +39,572 @@ def _target(
     )
 
 
-def test_processes_success_failure_and_skips_as_structured_receipts(caplog) -> None:
-    requests: list[httpx.Request] = []
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        if request.url.path == "/unavailable":
-            return httpx.Response(
-                503,
-                text="PRIVATE response body that must not leak",
-            )
-        return httpx.Response(200, json={"status": "accepted"})
-
-    targets = [
-        _target(
-            "success",
-            webhook=(
-                "https://api-user:api-password@remediation.example:8443/cancel"
-                "?api_key=private-query#private-fragment"
-            ),
-        ),
-        _target(
-            "http-failure",
-            action="PAUSE_JOB",
-            webhook="https://remediation.example/unavailable?token=private-token",
-        ),
-        _target("no-webhook", webhook=None),
-        _target(
-            "no-action",
-            action=None,
-            webhook="https://remediation.example/not-called?token=private-skip",
-        ),
-    ]
-
-    async def scenario() -> list[RemediationReceipt]:
-        async with httpx.AsyncClient(
-            transport=httpx.MockTransport(handler), timeout=10.0
-        ) as client:
-            engine = CompensatingActionEngine(http_client=client)
-            return await engine.process_blast_radius(targets, "INC-9942")
-
-    caplog.set_level(logging.INFO, logger="Aftershock-Engine")
-    caplog.set_level(logging.INFO, logger="httpx")
-    receipts = asyncio.run(scenario())
-
-    assert [receipt.status for receipt in receipts] == [
-        "succeeded",
-        "failed",
-        "skipped",
-        "skipped",
-    ]
-    assert receipts[0] == RemediationReceipt(
-        incident_id="INC-9942",
-        target_urn="urn:li:dataJob:success",
-        entity_type="DATA_JOB",
-        business_action="ISSUE_PO",
-        endpoint="https://remediation.example:8443/cancel",
-        status="succeeded",
-        http_status=200,
-        error=None,
+def _engine(
+    client: httpx.AsyncClient,
+    *allowed_endpoints: str,
+    max_concurrency: int = 8,
+    workflow_timeout_seconds: float = 30.0,
+) -> CompensatingActionEngine:
+    return CompensatingActionEngine(
+        http_client=client,
+        allowed_endpoints=allowed_endpoints,
+        max_concurrency=max_concurrency,
+        workflow_timeout_seconds=workflow_timeout_seconds,
     )
-    assert receipts[1].http_status == 503
-    assert receipts[1].error == "remediation endpoint returned HTTP 503"
-    assert receipts[1].endpoint == "https://remediation.example/unavailable"
-    assert receipts[2].http_status is None
-    assert receipts[2].error == "missing remediation webhook"
-    assert receipts[2].endpoint is None
-    assert receipts[3].http_status is None
-    assert receipts[3].error == "missing business action"
-    assert receipts[3].endpoint == "https://remediation.example/not-called"
-
-    assert len(requests) == 2
-    success_request = next(
-        request for request in requests if request.url.path == "/cancel"
-    )
-    assert success_request.url.username == "api-user"
-    assert success_request.url.password == "api-password"
-    assert success_request.url.query == b"api_key=private-query"
-    assert json.loads(success_request.content) == {
-        "incident_id": "INC-9942",
-        "target_urn": "urn:li:dataJob:success",
-        "action": "REVERT_STATE",
-        "business_action": "ISSUE_PO",
-    }
-    failed_request = next(
-        request for request in requests if request.url.path == "/unavailable"
-    )
-    assert json.loads(failed_request.content)["business_action"] == "PAUSE_JOB"
-
-    serialized = json.dumps([receipt.to_dict() for receipt in receipts])
-    combined_output = serialized + caplog.text
-    assert (
-        'HTTP Request: POST https://remediation.example:8443/cancel '
-        '"HTTP/1.1 200 OK"'
-    ) in caplog.text
-    assert (
-        'HTTP Request: POST https://remediation.example/unavailable '
-        '"HTTP/1.1 503 Service Unavailable"'
-    ) in caplog.text
-    for secret in (
-        "api-user",
-        "api-password",
-        "api_key",
-        "private-query",
-        "private-fragment",
-        "private-token",
-        "private-skip",
-        "PRIVATE response body",
-    ):
-        assert secret not in combined_output
 
 
-def test_network_and_unexpected_errors_are_isolated_and_order_is_preserved() -> None:
+def _run_one(
+    response_or_error,
+    *,
+    webhook: str = "https://remediation.example/cancel",
+) -> RemediationReceipt:
     async def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/network":
-            raise httpx.ConnectError(
-                "private network diagnostic", request=request
-            )
-        if request.url.path == "/unexpected":
-            raise RuntimeError("private handler detail")
-        if request.url.path == "/slow-success":
-            await asyncio.sleep(0.01)
-        return httpx.Response(200, json={"status": "accepted"})
-
-    targets = [
-        _target("slow", webhook="https://remediation.example/slow-success"),
-        _target("network", webhook="https://remediation.example/network"),
-        _target("unexpected", webhook="https://remediation.example/unexpected"),
-        _target("fast", webhook="https://remediation.example/fast-success"),
-    ]
-
-    async def scenario() -> list[RemediationReceipt]:
-        async with httpx.AsyncClient(
-            transport=httpx.MockTransport(handler), timeout=10.0
-        ) as client:
-            engine = CompensatingActionEngine(http_client=client)
-            return await engine.process_blast_radius(targets, "INC-ORDER")
-
-    receipts = asyncio.run(scenario())
-
-    assert [receipt.target_urn for receipt in receipts] == [
-        "urn:li:dataJob:slow",
-        "urn:li:dataJob:network",
-        "urn:li:dataJob:unexpected",
-        "urn:li:dataJob:fast",
-    ]
-    assert [receipt.status for receipt in receipts] == [
-        "succeeded",
-        "failed",
-        "failed",
-        "succeeded",
-    ]
-    assert receipts[1].http_status is None
-    assert receipts[1].error == "remediation request failed"
-    assert receipts[2].http_status is None
-    assert receipts[2].error == "unexpected remediation error"
-    serialized = json.dumps([receipt.to_dict() for receipt in receipts])
-    assert "private network diagnostic" not in serialized
-    assert "private handler detail" not in serialized
-
-
-@pytest.mark.parametrize(
-    "webhook",
-    [
-        "https://user:password@remediation.example:not-a-port/control?secret=1#x",
-        "not an absolute URL?secret=2#x",
-        "ftp://user:password@remediation.example/control?secret=3#x",
-    ],
-)
-def test_invalid_endpoint_fails_without_leaking_or_sending(webhook: str) -> None:
-    requests: list[httpx.Request] = []
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        return httpx.Response(200)
+        if isinstance(response_or_error, BaseException):
+            if isinstance(response_or_error, httpx.RequestError):
+                response_or_error.request = request
+            raise response_or_error
+        return response_or_error
 
     async def scenario() -> RemediationReceipt:
         async with httpx.AsyncClient(
             transport=httpx.MockTransport(handler), timeout=10.0
         ) as client:
-            engine = CompensatingActionEngine(http_client=client)
-            return await engine.execute_rollback(
-                _target("invalid", webhook=webhook), "INC-INVALID"
+            return await _engine(client, webhook).execute_rollback(
+                _target("one", webhook=webhook), "INC-ONE"
+            )
+
+    return asyncio.run(scenario())
+
+
+def test_terminal_v1_success_is_the_only_response_classified_succeeded() -> None:
+    receipt = _run_one(httpx.Response(200, json=TERMINAL_SUCCESS))
+
+    assert receipt == RemediationReceipt(
+        incident_id="INC-ONE",
+        target_urn="urn:li:dataJob:one",
+        entity_type="DATA_JOB",
+        business_action="ISSUE_PO",
+        endpoint="https://remediation.example/cancel",
+        status="succeeded",
+        http_status=200,
+        external_receipt_id="receipt-001",
+        error=None,
+    )
+
+
+@pytest.mark.parametrize("contract_status", ["accepted", "pending"])
+def test_valid_v1_nonterminal_contract_is_accepted(contract_status: str) -> None:
+    receipt = _run_one(
+        httpx.Response(
+            200,
+            json={
+                "receipt_version": 1,
+                "status": contract_status,
+                "receipt_id": "queue-42",
+            },
+        )
+    )
+
+    assert receipt.status == "accepted"
+    assert receipt.external_receipt_id == "queue-42"
+    assert receipt.error is None
+
+
+def test_valid_v1_failed_contract_is_terminal_failed_without_body_leak() -> None:
+    receipt = _run_one(
+        httpx.Response(
+            200,
+            json={
+                "receipt_version": 1,
+                "status": "failed",
+                "receipt_id": "failure-9",
+                "detail": "PRIVATE downstream detail",
+            },
+        )
+    )
+
+    assert receipt.status == "failed"
+    assert receipt.external_receipt_id == "failure-9"
+    assert receipt.error == "remediation endpoint reported terminal failure"
+    assert "PRIVATE" not in json.dumps(receipt.to_dict())
+
+
+@pytest.mark.parametrize(
+    ("response", "expected_receipt_id"),
+    [
+        (httpx.Response(202, text="not-json PRIVATE"), None),
+        (httpx.Response(200, json={"accepted": True}), None),
+        (
+            httpx.Response(
+                200, json={"accepted": True, "receipt_id": "legacy-accepted-3"}
+            ),
+            "legacy-accepted-3",
+        ),
+    ],
+)
+def test_explicit_or_http_202_acceptance_is_nonterminal(
+    response: httpx.Response, expected_receipt_id: str | None
+) -> None:
+    receipt = _run_one(response)
+
+    assert receipt.status == "accepted"
+    assert receipt.external_receipt_id == expected_receipt_id
+    assert receipt.error is None
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(200),
+        httpx.Response(200, text="not-json PRIVATE"),
+        httpx.Response(200, json={"status": "succeeded", "receipt_id": "old"}),
+        httpx.Response(
+            200,
+            json={"receipt_version": 2, "status": "succeeded", "receipt_id": "x"},
+        ),
+        httpx.Response(
+            200,
+            json={"receipt_version": 1, "status": "succeeded", "receipt_id": " "},
+        ),
+        httpx.Response(
+            200,
+            json={
+                "receipt_version": 1,
+                "status": "succeeded",
+                "receipt_id": "x" * 257,
+            },
+        ),
+        httpx.Response(
+            200,
+            json={"receipt_version": 1, "status": "mystery", "receipt_id": "x"},
+        ),
+    ],
+)
+def test_ambiguous_successful_http_response_is_outcome_unknown(
+    response: httpx.Response,
+) -> None:
+    receipt = _run_one(response)
+
+    assert receipt.status == "outcome_unknown"
+    assert receipt.external_receipt_id is None
+    assert receipt.error == "remediation endpoint returned no valid terminal receipt"
+    assert "PRIVATE" not in json.dumps(receipt.to_dict())
+
+
+def test_unexpected_json_decoder_failure_is_outcome_unknown() -> None:
+    class BrokenJSONResponse(httpx.Response):
+        def json(self, **_):
+            raise RuntimeError("PRIVATE decoder detail")
+
+    receipt = _run_one(BrokenJSONResponse(200))
+
+    assert receipt.status == "outcome_unknown"
+    assert receipt.error == "remediation endpoint returned no valid terminal receipt"
+    assert "PRIVATE" not in json.dumps(receipt.to_dict())
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        httpx.ReadTimeout("PRIVATE timeout"),
+        httpx.ConnectError("PRIVATE network"),
+        RuntimeError("PRIVATE transport bug"),
+    ],
+)
+def test_error_after_dispatch_is_outcome_unknown_and_secret_safe(error) -> None:
+    receipt = _run_one(error)
+
+    assert receipt.status == "outcome_unknown"
+    assert receipt.http_status is None
+    assert receipt.external_receipt_id is None
+    assert receipt.error == "remediation outcome unknown after dispatch"
+    assert "PRIVATE" not in json.dumps(receipt.to_dict())
+
+
+def test_request_build_failure_is_failed_before_dispatch() -> None:
+    requests: list[httpx.Request] = []
+    endpoint = "https://remediation.example/cancel"
+
+    async def scenario() -> RemediationReceipt:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda request: requests.append(request)
+                or httpx.Response(200, json=TERMINAL_SUCCESS)
+            )
+        ) as client:
+            return await _engine(client, endpoint).execute_rollback(
+                _target("build-failure", webhook=endpoint), "\ud800"
             )
 
     receipt = asyncio.run(scenario())
 
-    assert receipt.status == "failed"
-    assert receipt.endpoint is None
-    assert receipt.http_status is None
-    assert receipt.error == "invalid remediation endpoint"
     assert requests == []
+    assert receipt.status == "failed"
+    assert receipt.http_status is None
+    assert receipt.external_receipt_id is None
+    assert receipt.error == "remediation request could not be prepared"
+
+
+@pytest.mark.parametrize("http_status", [400, 404, 429, 500, 503])
+def test_http_client_or_server_error_is_failed(http_status: int) -> None:
+    receipt = _run_one(
+        httpx.Response(http_status, text="PRIVATE response body")
+    )
+
+    assert receipt.status == "failed"
+    assert receipt.http_status == http_status
+    assert receipt.error == f"remediation endpoint returned HTTP {http_status}"
+    assert "PRIVATE" not in json.dumps(receipt.to_dict())
+
+
+def test_redirect_is_not_followed_and_is_reported_failed() -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            302, headers={"Location": "https://unlisted.example/steal?secret=1"}
+        )
+
+    async def scenario() -> RemediationReceipt:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), follow_redirects=True
+        ) as client:
+            return await _engine(
+                client, "https://remediation.example/cancel"
+            ).execute_rollback(_target("redirect"), "INC-REDIRECT")
+
+    receipt = asyncio.run(scenario())
+
+    assert len(requests) == 1
+    assert receipt.status == "failed"
+    assert receipt.http_status == 302
+    assert receipt.error == "remediation endpoint returned HTTP 302"
+
+
+def test_allowlist_parser_accepts_exact_governed_urls(monkeypatch) -> None:
+    raw = json.dumps(
+        [
+            "https://controls.example/cancel?tenant=one",
+            "http://127.0.0.1:8080/revert",
+            "http://localhost:9000/pause",
+            "http://[::1]:7000/control",
+        ]
+    )
+    expected = frozenset(json.loads(raw))
+
+    assert parse_remediation_allowlist_json(raw) == expected
+    monkeypatch.setenv("AFTERSHOCK_REMEDIATION_ALLOWLIST_JSON", raw)
+    assert build_remediation_allowlist_from_env() == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        None,
+        "",
+        "not-json PRIVATE",
+        "{}",
+        "[]",
+        '["https://controls.example/x", 7]',
+        '[" https://controls.example/x"]',
+        '["ftp://controls.example/x"]',
+        '["https://user:pass@controls.example/x"]',
+        '["https://controls.example/x#fragment"]',
+        '["https://controls.example/x#"]',
+        '["http://controls.example/x"]',
+    ],
+)
+def test_allowlist_parser_rejects_missing_malformed_or_unsafe_config(
+    raw: str | None,
+) -> None:
+    with pytest.raises(RemediationConfigurationError) as error:
+        parse_remediation_allowlist_json(raw)
+
+    assert str(error.value) == "invalid remediation endpoint allowlist configuration"
+    assert "PRIVATE" not in str(error.value)
+
+
+def test_engine_rejects_nonstring_allowlist_entries_with_fixed_error() -> None:
+    with pytest.raises(RemediationConfigurationError) as error:
+        CompensatingActionEngine(
+            allowed_endpoints=[["https://controls.example/x"]]  # type: ignore[list-item]
+        )
+
+    assert str(error.value) == "invalid remediation endpoint allowlist configuration"
+
+
+@pytest.mark.parametrize(
+    "webhook",
+    [
+        "https://controls.example/control/child",
+        "https://controls.example/control?tenant=two",
+        "https://controls.example/control?tenant=one&extra=1",
+        "https://user:password@controls.example/control?tenant=one",
+        "https://controls.example/control?tenant=one#fragment",
+        "http://controls.example/control?tenant=one",
+    ],
+)
+def test_unlisted_or_unsafe_endpoint_never_dispatches(webhook: str) -> None:
+    requests: list[httpx.Request] = []
+    allowed = "https://controls.example/control?tenant=one"
+
+    async def scenario() -> RemediationReceipt:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda request: requests.append(request)
+                or httpx.Response(200, json=TERMINAL_SUCCESS)
+            )
+        ) as client:
+            return await _engine(client, allowed).execute_rollback(
+                _target("denied", webhook=webhook), "INC-DENIED"
+            )
+
+    receipt = asyncio.run(scenario())
+
+    assert requests == []
+    assert receipt.status in {"failed", "skipped"}
+    assert receipt.external_receipt_id is None
     serialized = json.dumps(receipt.to_dict())
-    assert "user" not in serialized
-    assert "password" not in serialized
-    assert "secret" not in serialized
+    for secret in ("user", "password", "fragment", "extra"):
+        assert secret not in serialized
 
 
-def test_execute_rollback_does_not_swallow_base_exceptions() -> None:
-    class StopSignal(BaseException):
-        pass
+def test_no_allowlist_denies_outbound_call() -> None:
+    requests: list[httpx.Request] = []
 
-    async def handler(_: httpx.Request) -> httpx.Response:
-        raise StopSignal()
+    async def scenario() -> RemediationReceipt:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda request: requests.append(request)
+                or httpx.Response(200, json=TERMINAL_SUCCESS)
+            )
+        ) as client:
+            return await CompensatingActionEngine(
+                http_client=client
+            ).execute_rollback(_target("denied"), "INC-NO-POLICY")
+
+    receipt = asyncio.run(scenario())
+
+    assert requests == []
+    assert receipt.status == "skipped"
+    assert receipt.error == "remediation endpoint is not allowlisted"
+
+
+def test_exact_allowlisted_url_dispatches_unchanged_and_is_sanitized_in_receipt(
+    caplog,
+) -> None:
+    endpoint = "https://controls.example/control?tenant=one&signature=PRIVATE"
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=TERMINAL_SUCCESS)
+
+    async def scenario() -> RemediationReceipt:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            return await _engine(client, endpoint).execute_rollback(
+                _target("allowed", webhook=endpoint), "INC-ALLOWED"
+            )
+
+    caplog.set_level(logging.INFO, logger="httpx")
+    receipt = asyncio.run(scenario())
+
+    assert len(requests) == 1
+    assert str(requests[0].url) == endpoint
+    assert receipt.status == "succeeded"
+    assert receipt.endpoint == "https://controls.example/control"
+    combined = caplog.text + json.dumps(receipt.to_dict())
+    assert "signature" not in combined
+    assert "PRIVATE" not in combined
+
+
+def test_missing_playbook_skips_before_endpoint_policy() -> None:
+    async def scenario() -> list[RemediationReceipt]:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda _: (_ for _ in ()).throw(AssertionError("must not send"))
+            )
+        ) as client:
+            engine = _engine(client, "https://x.example/x")
+            return [
+                await engine.execute_rollback(
+                    _target("no-webhook", webhook=None), "INC-MISSING"
+                ),
+                await engine.execute_rollback(
+                    _target("no-action", action=None, webhook="https://x.example/x"),
+                    "INC-MISSING",
+                ),
+            ]
+
+    receipts = asyncio.run(scenario())
+    assert [receipt.status for receipt in receipts] == ["skipped", "skipped"]
+    assert [receipt.error for receipt in receipts] == [
+        "missing remediation webhook",
+        "missing business action",
+    ]
+
+
+def test_process_blast_radius_uses_bounded_workers_and_preserves_order() -> None:
+    targets = [
+        _target(str(index), webhook=f"https://controls.example/{index}")
+        for index in range(5)
+    ]
+    allowed = [target.remediation_webhook for target in targets]
+
+    async def scenario() -> tuple[list[RemediationReceipt], int, list[str]]:
+        release = asyncio.Event()
+        two_started = asyncio.Event()
+        active = 0
+        maximum_active = 0
+        started: list[str] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal active, maximum_active
+            active += 1
+            maximum_active = max(maximum_active, active)
+            started.append(request.url.path)
+            if len(started) == 2:
+                two_started.set()
+            await release.wait()
+            active -= 1
+            return httpx.Response(
+                200,
+                json={
+                    "receipt_version": 1,
+                    "status": "succeeded",
+                    "receipt_id": f"receipt-{request.url.path[1:]}",
+                },
+            )
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            engine = _engine(client, *allowed, max_concurrency=2)
+            task = asyncio.create_task(
+                engine.process_blast_radius(targets, "INC-BOUNDED")
+            )
+            await two_started.wait()
+            await asyncio.sleep(0)
+            assert started == ["/0", "/1"]
+            release.set()
+            receipts = await task
+        return receipts, maximum_active, started
+
+    receipts, maximum_active, started = asyncio.run(scenario())
+
+    assert maximum_active == 2
+    assert started == ["/0", "/1", "/2", "/3", "/4"]
+    assert [receipt.target_urn for receipt in receipts] == [
+        f"urn:li:dataJob:{index}" for index in range(5)
+    ]
+    assert [receipt.external_receipt_id for receipt in receipts] == [
+        f"receipt-{index}" for index in range(5)
+    ]
+
+
+def test_workflow_deadline_marks_inflight_unknown_and_never_started_skipped() -> None:
+    targets = [
+        _target(str(index), webhook=f"https://controls.example/{index}")
+        for index in range(3)
+    ]
+    handler_cancelled = False
+
+    async def scenario() -> list[RemediationReceipt]:
+        async def handler(_: httpx.Request) -> httpx.Response:
+            nonlocal handler_cancelled
+            try:
+                await asyncio.Event().wait()
+            finally:
+                handler_cancelled = True
+            raise AssertionError("unreachable")
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            engine = _engine(
+                client,
+                *(target.remediation_webhook for target in targets),
+                max_concurrency=1,
+                workflow_timeout_seconds=0.01,
+            )
+            return await engine.process_blast_radius(targets, "INC-DEADLINE")
+
+    receipts = asyncio.run(scenario())
+
+    assert handler_cancelled is True
+    assert [receipt.status for receipt in receipts] == [
+        "outcome_unknown",
+        "skipped",
+        "skipped",
+    ]
+    assert [receipt.error for receipt in receipts] == [
+        "workflow deadline expired after dispatch",
+        "workflow deadline expired before dispatch",
+        "workflow deadline expired before dispatch",
+    ]
+
+
+def test_external_cancellation_propagates_and_cleans_up_workers() -> None:
+    cancelled = asyncio.Event()
+    started = asyncio.Event()
 
     async def scenario() -> None:
+        async def handler(_: httpx.Request) -> httpx.Response:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+            raise AssertionError("unreachable")
+
+        endpoint = "https://controls.example/hang"
         async with httpx.AsyncClient(
-            transport=httpx.MockTransport(handler), timeout=10.0
+            transport=httpx.MockTransport(handler)
         ) as client:
-            engine = CompensatingActionEngine(http_client=client)
-            with pytest.raises(StopSignal):
-                await engine.execute_rollback(
-                    _target("cancelled", webhook="https://remediation.example/stop"),
-                    "INC-CANCEL",
+            task = asyncio.create_task(
+                _engine(client, endpoint).process_blast_radius(
+                    [_target("hang", webhook=endpoint)], "INC-CANCEL"
                 )
+            )
+            await started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await cancelled.wait()
 
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize(
+    ("max_concurrency", "timeout"),
+    [(0, 1.0), (-1, 1.0), (True, 1.0), (1, 0), (1, -1), (1, float("inf"))],
+)
+def test_invalid_execution_bounds_are_rejected(
+    max_concurrency, timeout
+) -> None:
+    with pytest.raises(ValueError):
+        CompensatingActionEngine(
+            allowed_endpoints=(),
+            max_concurrency=max_concurrency,
+            workflow_timeout_seconds=timeout,
+        )
+
+
 def test_engine_closes_only_the_client_it_owns() -> None:
     async def scenario() -> tuple[bool, bool]:
-        owned_engine = CompensatingActionEngine()
+        owned_engine = CompensatingActionEngine(allowed_endpoints=())
         await owned_engine.aclose()
         owned_closed = owned_engine.http_client.is_closed
 
         external_client = httpx.AsyncClient(
             transport=httpx.MockTransport(lambda _: httpx.Response(200))
         )
-        external_engine = CompensatingActionEngine(http_client=external_client)
+        external_engine = CompensatingActionEngine(
+            http_client=external_client, allowed_endpoints=()
+        )
         await external_engine.aclose()
         external_closed_by_engine = external_client.is_closed
         await external_client.aclose()
@@ -267,16 +615,17 @@ def test_engine_closes_only_the_client_it_owns() -> None:
 
 def test_downstream_idempotency_key_is_stable_and_scoped_without_deduping() -> None:
     requests: list[httpx.Request] = []
+    endpoint = "https://remediation.example/cancel"
 
     async def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        return httpx.Response(200)
+        return httpx.Response(200, json=TERMINAL_SUCCESS)
 
     async def scenario() -> None:
         async with httpx.AsyncClient(
             transport=httpx.MockTransport(handler), timeout=10.0
         ) as client:
-            engine = CompensatingActionEngine(http_client=client)
+            engine = _engine(client, endpoint)
             first_target = _target("stable", action="PAUSE_JOB")
             await engine.execute_rollback(first_target, "INC-RETRY")
             await engine.execute_rollback(first_target, "INC-RETRY")
@@ -296,6 +645,26 @@ def test_downstream_idempotency_key_is_stable_and_scoped_without_deduping() -> N
     assert all(re.fullmatch(r"aftershock-[0-9a-f]{64}", key) for key in keys)
     assert requests[0].url == requests[1].url
     assert requests[0].content == requests[1].content
+
+
+def test_execute_rollback_does_not_swallow_base_exceptions() -> None:
+    class StopSignal(BaseException):
+        pass
+
+    async def handler(_: httpx.Request) -> httpx.Response:
+        raise StopSignal()
+
+    async def scenario() -> None:
+        endpoint = "https://remediation.example/stop"
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), timeout=10.0
+        ) as client:
+            with pytest.raises(StopSignal):
+                await _engine(client, endpoint).execute_rollback(
+                    _target("cancelled", webhook=endpoint), "INC-CANCEL"
+                )
+
+    asyncio.run(scenario())
 
 
 def test_httpx_request_log_filter_installation_is_thread_safe_and_idempotent() -> None:

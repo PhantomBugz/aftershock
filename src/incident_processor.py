@@ -196,8 +196,9 @@ def _render_summary(
         "",
         "## Compensating-control receipts",
         "",
-        "| Target URN | Entity type | Business action | Endpoint | Status | HTTP status | Error |",
-        "| --- | --- | --- | --- | --- | --- | --- |",
+        "| Target URN | Entity type | Business action | Endpoint | Status | "
+        "HTTP status | External receipt ID | Error |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     if receipts:
         for receipt in receipts:
@@ -208,6 +209,7 @@ def _render_summary(
                 receipt.endpoint,
                 receipt.status,
                 receipt.http_status,
+                receipt.external_receipt_id,
                 receipt.error,
             )
             lines.append(

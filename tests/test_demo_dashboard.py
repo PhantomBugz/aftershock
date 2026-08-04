@@ -15,6 +15,10 @@ from remediation_models import IncidentReport
 
 
 FIXED_NOW = datetime(2026, 8, 4, 15, 16, 17, tzinfo=timezone.utc)
+FIXTURE_ENDPOINTS = (
+    "https://api.internal.example/remediate/cancel_po",
+    "https://api.internal.example/remediate/revert_pricing",
+)
 
 
 def _console(output: StringIO) -> Console:
@@ -29,6 +33,8 @@ def _console(output: StringIO) -> Console:
 def _run(
     context: FixtureDataHubContext,
     handler,
+    *,
+    allowed_endpoints: tuple[str, ...] = FIXTURE_ENDPOINTS,
 ) -> tuple[IncidentReport, str]:
     output = StringIO()
 
@@ -40,6 +46,7 @@ def _run(
                 console=_console(output),
                 context=context,
                 http_client=client,
+                remediation_allowlist=allowed_endpoints,
                 clock=lambda: FIXED_NOW,
                 delay=0,
             )
@@ -79,7 +86,14 @@ def test_dashboard_runs_processor_records_fixture_document_and_displays_report()
 
     async def remediation(request: httpx.Request) -> httpx.Response:
         requests.append((request.url.path, json.loads(request.content)))
-        return httpx.Response(200, json={"accepted": True})
+        return httpx.Response(
+            200,
+            json={
+                "receipt_version": 1,
+                "status": "succeeded",
+                "receipt_id": f"fixture{request.url.path.replace('/', '-')}",
+            },
+        )
 
     report, rendered = _run(context, remediation)
 
@@ -113,6 +127,11 @@ def test_dashboard_runs_processor_records_fixture_document_and_displays_report()
         assert receipt.status in rendered
         assert str(receipt.http_status) in rendered
         assert receipt.endpoint in rendered
+        assert receipt.external_receipt_id in rendered
+    assert [receipt.external_receipt_id for receipt in report.receipts] == [
+        "fixture-remediate-cancel_po",
+        "fixture-remediate-revert_pricing",
+    ]
     assert "Recorded write-back status: succeeded" in rendered
     assert report.writeback.document_urn in rendered
     assert "in-memory fixture recorder" in rendered
@@ -126,6 +145,31 @@ def test_dashboard_runs_processor_records_fixture_document_and_displays_report()
         "/remediate/revert_pricing",
     }
     assert {payload["incident_id"] for _, payload in requests} == {"INC-9942"}
+
+
+def test_default_fixture_transport_returns_explicit_terminal_receipts() -> None:
+    context = FixtureDataHubContext()
+    output = StringIO()
+
+    report = asyncio.run(
+        run_demo(
+            console=_console(output),
+            context=context,
+            clock=lambda: FIXED_NOW,
+            delay=0,
+        )
+    )
+
+    assert [receipt.status for receipt in report.receipts] == [
+        "succeeded",
+        "succeeded",
+    ]
+    assert [receipt.external_receipt_id for receipt in report.receipts] == [
+        "fixture-receipt-cancel_po",
+        "fixture-receipt-revert_pricing",
+    ]
+    assert "deterministic local test doubles" in output.getvalue()
+    assert "fixture-receipt-cancel_po" in output.getvalue()
 
 
 def _fixture_with_target(
@@ -190,6 +234,7 @@ def test_dashboard_escapes_dynamic_values_and_marks_failed_control_as_issues(
     report, rendered = _run(
         context,
         lambda _: httpx.Response(503, text="private failure body must not render"),
+        allowed_endpoints=("https://controls.example/fail",),
     )
 
     assert report.receipts[0].status == "failed"
@@ -218,6 +263,33 @@ def test_dashboard_marks_skipped_control_as_completed_with_issues(
     assert "all discovered controls succeeded" not in rendered
 
 
+@pytest.mark.parametrize(
+    ("response", "expected_status"),
+    [
+        (httpx.Response(202, json={"accepted": True}), "accepted"),
+        (httpx.Response(200, json={"status": "succeeded"}), "outcome_unknown"),
+    ],
+)
+def test_dashboard_never_calls_nonterminal_receipts_complete(
+    tmp_path: Path,
+    response: httpx.Response,
+    expected_status: str,
+) -> None:
+    endpoint = "https://controls.example/nonterminal"
+    context = _fixture_with_target(tmp_path, webhook=endpoint)
+
+    report, rendered = _run(
+        context,
+        lambda _: response,
+        allowed_endpoints=(endpoint,),
+    )
+
+    assert report.receipts[0].status == expected_status
+    assert expected_status in rendered
+    assert "COMPLETED WITH ISSUES" in rendered
+    assert "all discovered controls succeeded" not in rendered
+
+
 class _FailingWritebackFixture(FixtureDataHubContext):
     async def save_document(self, **_: Any) -> dict[str, Any]:
         raise RuntimeError("writeback secret must not be rendered")
@@ -226,7 +298,17 @@ class _FailingWritebackFixture(FixtureDataHubContext):
 def test_dashboard_marks_writeback_failure_as_completed_with_issues() -> None:
     context = _FailingWritebackFixture()
 
-    report, rendered = _run(context, lambda _: httpx.Response(200))
+    def terminal(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "receipt_version": 1,
+                "status": "succeeded",
+                "receipt_id": f"fixture{request.url.path.replace('/', '-')}",
+            },
+        )
+
+    report, rendered = _run(context, terminal)
 
     assert all(receipt.status == "succeeded" for receipt in report.receipts)
     assert report.writeback.status == "failed"

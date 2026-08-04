@@ -7,6 +7,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+import lineage_listener
 from compensating_action_engine import CompensatingActionEngine
 from datahub_context import FixtureDataHubContext, MCPDataHubContext
 from incident_processor import AftershockIncidentProcessor, _incident_document_urn
@@ -31,6 +32,14 @@ SAFE_AUTH_CONFIG_FAILURE = {
 }
 SAFE_UNAUTHORIZED = {"detail": "Unauthorized critical incident request"}
 TEST_WEBHOOK_TOKEN = "test-aftershock-webhook-token"
+CONTROL_ENDPOINTS = (
+    "https://controls.example/cancel-po",
+    "https://controls.example/revert-price",
+)
+FIXTURE_ENDPOINTS = (
+    "https://api.internal.example/remediate/cancel_po",
+    "https://api.internal.example/remediate/revert_pricing",
+)
 
 
 def _property(qualified_name: str, value: str) -> dict[str, Any]:
@@ -113,7 +122,14 @@ def test_critical_envelope_runs_real_mcp_processor_and_returns_report(
     async def remediation(request: httpx.Request) -> httpx.Response:
         requests.append(request)
         recorder.events.append(f"http:{request.url.path}")
-        return httpx.Response(200, json={"accepted": True})
+        return httpx.Response(
+            200,
+            json={
+                "receipt_version": 1,
+                "status": "succeeded",
+                "receipt_id": f"terminal{request.url.path.replace('/', '-')}",
+            },
+        )
 
     @asynccontextmanager
     async def session():
@@ -123,7 +139,10 @@ def test_critical_envelope_runs_real_mcp_processor_and_returns_report(
         ) as http_client:
             yield AftershockIncidentProcessor(
                 context,
-                CompensatingActionEngine(http_client=http_client),
+                CompensatingActionEngine(
+                    http_client=http_client,
+                    allowed_endpoints=CONTROL_ENDPOINTS,
+                ),
                 clock=lambda: FIXED_NOW,
             )
 
@@ -148,10 +167,20 @@ def test_critical_envelope_runs_real_mcp_processor_and_returns_report(
     assert body["dataset_urn"] == DATASET_URN
     assert body["context_mode"] == "mcp"
     assert body["execution_mode"] == "DATAHUB MCP MODE"
-    assert body["counts"] == {"succeeded": 2, "failed": 0, "skipped": 0}
+    assert body["counts"] == {
+        "succeeded": 2,
+        "accepted": 0,
+        "failed": 0,
+        "skipped": 0,
+        "outcome_unknown": 0,
+    }
     assert [receipt["status"] for receipt in body["receipts"]] == [
         "succeeded",
         "succeeded",
+    ]
+    assert [receipt["external_receipt_id"] for receipt in body["receipts"]] == [
+        "terminal-cancel-po",
+        "terminal-revert-price",
     ]
     assert body["writeback"] == {
         "status": "succeeded",
@@ -226,6 +255,43 @@ def test_noncritical_envelope_is_ignored_without_context_or_authentication(
     assert authenticated is False
 
 
+@pytest.mark.parametrize("raw_allowlist", [None, "not-json PRIVATE-ALLOWLIST"])
+def test_default_critical_session_rejects_missing_or_malformed_allowlist_before_context(
+    monkeypatch, raw_allowlist: str | None
+) -> None:
+    monkeypatch.setenv("AFTERSHOCK_WEBHOOK_TOKEN", TEST_WEBHOOK_TOKEN)
+    if raw_allowlist is None:
+        monkeypatch.delenv("AFTERSHOCK_REMEDIATION_ALLOWLIST_JSON", raising=False)
+    else:
+        monkeypatch.setenv(
+            "AFTERSHOCK_REMEDIATION_ALLOWLIST_JSON", raw_allowlist
+        )
+    context_built = False
+
+    def build_context() -> FixtureDataHubContext:
+        nonlocal context_built
+        context_built = True
+        return FixtureDataHubContext()
+
+    monkeypatch.setattr(
+        lineage_listener, "build_datahub_context_from_env", build_context
+    )
+
+    response = _post(
+        {
+            "incident_id": "INC-POLICY-CONFIG",
+            "dataset_urn": DATASET_URN,
+            "severity": "CRITICAL",
+        },
+        authorization=f"Bearer {TEST_WEBHOOK_TOKEN}",
+    )
+
+    assert response.status_code == 503
+    assert response.json() == SAFE_FAILURE
+    assert "PRIVATE-ALLOWLIST" not in response.text
+    assert context_built is False
+
+
 def test_mcp_failure_returns_fixed_secret_safe_service_error(monkeypatch) -> None:
     monkeypatch.setenv("AFTERSHOCK_WEBHOOK_TOKEN", TEST_WEBHOOK_TOKEN)
     recorder = _critical_recorder()
@@ -240,7 +306,10 @@ def test_mcp_failure_returns_fixed_secret_safe_service_error(monkeypatch) -> Non
         ) as http_client:
             yield AftershockIncidentProcessor(
                 context,
-                CompensatingActionEngine(http_client=http_client),
+                CompensatingActionEngine(
+                    http_client=http_client,
+                    allowed_endpoints=CONTROL_ENDPOINTS,
+                ),
                 clock=lambda: FIXED_NOW,
             )
 
@@ -353,11 +422,23 @@ def test_critical_fixture_response_is_unmistakably_labeled(monkeypatch) -> None:
     @asynccontextmanager
     async def session():
         async with httpx.AsyncClient(
-            transport=httpx.MockTransport(lambda _: httpx.Response(200))
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200,
+                    json={
+                        "receipt_version": 1,
+                        "status": "succeeded",
+                        "receipt_id": f"fixture{request.url.path.replace('/', '-')}",
+                    },
+                )
+            )
         ) as http_client:
             yield AftershockIncidentProcessor(
                 context,
-                CompensatingActionEngine(http_client=http_client),
+                CompensatingActionEngine(
+                    http_client=http_client,
+                    allowed_endpoints=FIXTURE_ENDPOINTS,
+                ),
                 clock=lambda: FIXED_NOW,
             )
 
