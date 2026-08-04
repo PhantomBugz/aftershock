@@ -312,8 +312,9 @@ def _parse_lineage_page(
         has_more = downstreams.get("hasMore", False)
         if (
             (
-                "total" in downstreams
-                and (not _is_nonnegative_int(total) or total != 0)
+                "total" not in downstreams
+                or not _is_nonnegative_int(total)
+                or total != 0
             )
             or (
                 "offset" in downstreams

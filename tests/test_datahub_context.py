@@ -162,6 +162,8 @@ def test_get_lineage_normalizes_legitimate_cleaned_zero_result_shape() -> None:
     [
         None,
         [],
+        {},
+        {"facets": []},
         {
             "searchResults": {},
             "total": 1,
