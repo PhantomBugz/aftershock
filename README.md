@@ -299,9 +299,11 @@ Licensed under the [Apache License 2.0](LICENSE). The
 [public repository](https://github.com/PhantomBugz/aftershock) contains the
 reviewed implementation, setup guide, reproducible examples, captured live
 proof transcript, and DataHub screenshot. GitHub's Apache-2.0 license detection
-was verified on August 4, 2026. Publishing the final project and video URLs,
-completing the Devpost form, and checking every judge-facing resource while
-signed out remain release steps; see the
+was verified on August 4, 2026. The public
+[project URL](https://aftershock.phantombugz.com) and
+[2:48 demonstration video](https://youtu.be/yopSGs_kx5s) were published and
+verified anonymously on August 5, 2026. Completing the Devpost form and its
+personal eligibility confirmations remains the final release step; see the
 [submission checklist](docs/submission-checklist.md).
 
 [mcp]: https://docs.datahub.com/docs/features/feature-guides/mcp

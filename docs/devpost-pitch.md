@@ -2,6 +2,12 @@
 
 **Primary challenge category:** Agents That Do Real Work
 
+**Project/test URL:** <https://aftershock.phantombugz.com>
+
+**Source repository:** <https://github.com/PhantomBugz/aftershock>
+
+**Demo video:** <https://youtu.be/yopSGs_kx5s>
+
 ## Inspiration
 
 Data-quality tools can identify an unreliable dataset, and lineage can show

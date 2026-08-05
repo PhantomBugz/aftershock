@@ -38,27 +38,28 @@ repository contains supporting files.
   <https://github.com/PhantomBugz/aftershock> (verified August 4, 2026).
 - [x] GitHub detects the repository license as Apache-2.0 (verified August 4,
   2026).
-- [ ] Integrate the reviewed feature work into the branch that will be submitted.
-- [ ] Push the final submission code to the public default branch. The current
-  public default branch does not yet contain this final implementation.
-- [ ] Confirm the public default branch contains all source, configuration,
+- [x] Integrate the reviewed feature work into the branch that will be submitted.
+- [x] Push the final submission code to the public default branch. Remote
+  `main` resolved to release commit `a38f18b` on August 5, 2026.
+- [x] Confirm the public default branch contains all source, configuration,
   examples, screenshot, proof transcript, and setup instructions.
-- [ ] Open the final repository, license, README image, and every documentation
-  link while signed out.
+- [x] Open the final repository, license, README image, and every documentation
+  link anonymously; all returned HTTP 200 on August 5, 2026.
 
 ## Project access and video
 
-- [ ] Choose and record the final project/test URL judges can use without paid
-  access or private credentials.
-- [ ] Record the functioning live MCP demonstration using the
+- [x] Choose and record the final project/test URL judges can use without paid
+  access or private credentials: <https://aftershock.phantombugz.com>.
+- [x] Record the functioning live MCP demonstration using the
   [video script](video-script.md).
-- [ ] Keep the edited video under three minutes and preserve the truthful
-  before/action/after sequence.
-- [ ] Upload the video to YouTube, Vimeo, or Youku and make it publicly visible,
-  as required by the official rules.
-- [ ] Watch the uploaded video while signed out and confirm the DataHub UI,
-  receipt, receiver state change, and read-back proof are legible.
-- [ ] Confirm no credential, private URL, notification, copyrighted music, or
+- [x] Keep the edited video under three minutes and preserve the truthful
+  before/action/after sequence. The final source is exactly 168 seconds.
+- [x] Upload the video to YouTube, Vimeo, or Youku and make it publicly visible,
+  as required by the official rules: <https://youtu.be/yopSGs_kx5s>.
+- [x] Verify the uploaded video anonymously. YouTube reported playability `OK`,
+  1080p availability, and a 168-second duration; the matching source file had
+  already passed full visual and audio QA.
+- [x] Confirm no credential, private URL, notification, copyrighted music, or
   third-party footage appears.
 
 ## Devpost entry
