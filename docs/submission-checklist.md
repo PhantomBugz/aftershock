@@ -73,23 +73,24 @@ repository contains supporting files.
 
 ## Devpost entry
 
-- [ ] Select **Agents That Do Real Work** as the primary category.
-- [ ] Confirm that the submitted project was newly created during the July 6 to
+- [x] Select **Agents That Do Real Work** as the primary category.
+- [x] Confirm that the submitted project was newly created during the July 6 to
   August 10, 2026 submission period and disclose any pre-existing code or work
   incorporated into it.
-- [ ] Paste the final URLs into Devpost: project/test
+- [x] Paste the final URLs into Devpost: project/test
   <https://aftershock.phantombugz.com>, repository
   <https://github.com/PhantomBugz/aftershock>, and video
   <https://youtu.be/yopSGs_kx5s>.
-- [ ] Use the reviewed [Devpost copy](devpost-pitch.md).
-- [ ] Include the AI-assistance disclosure from the README.
-- [ ] Opt in to the feedback section only if desired, and review the
+- [x] Use the reviewed [Devpost copy](devpost-pitch.md).
+- [x] Include the AI-assistance disclosure from the README.
+- [x] Opt in to the feedback section only if desired, and review the
   [feedback survey draft](FEEDBACK_SURVEY_DRAFT.md) before submitting it.
-- [ ] Verify every required field, team/representative detail, and eligibility
+- [x] Verify every required field, team/representative detail, and eligibility
   statement personally before the deadline.
-- [ ] Submit the entry.
-- [ ] Reopen the submitted entry, repository, project URL, and video while signed
+- [x] Submit the entry.
+- [x] Reopen the submitted entry, repository, project URL, and video while signed
   out to confirm judge access.
 
-The project is not fully submitted until every unchecked external gate above is
-complete.
+The Devpost entry was submitted and anonymously verified on August 5, 2026.
+Keep the submission, repository, project URL, and video public throughout the
+judging period.
