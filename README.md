@@ -267,7 +267,7 @@ handling, receiver requirements, and exact commands.
 - `config/` and `scripts/` — safe live metadata bootstrap
 - `tests/` — unit, MCP protocol, API, dashboard, and opt-in live tests
 - `examples/` — captured outputs labeled by execution mode
-- `docs/submission-checklist.md` — human actions still required before entry
+- `docs/submission-checklist.md` — completed technical and external release gates
 
 ## Current boundary
 

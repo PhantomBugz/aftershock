@@ -3,9 +3,9 @@
 **Submission deadline:** August 10, 2026 at 5:00 PM EDT
 ([official rules](https://datahub.devpost.com/rules)).
 
-This file separates verified technical evidence from the external actions that
-still require a person. An unchecked item is not complete merely because the
-repository contains supporting files.
+This file records the verified technical evidence and external actions completed
+for the submission. Each checked item is backed by the repository, the public
+artifact, or the completed Devpost workflow.
 
 ## Verified technical evidence
 
