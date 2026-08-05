@@ -110,6 +110,24 @@ already-issued order can be canceled, further issuance can be stopped through
 an exact grant, and the resulting PO-bound receipt can be preserved for the
 next operator or agent.
 
+## Challenges we ran into
+
+The hardest part was proving outcomes instead of inferring them. An HTTP
+success code does not prove that a business action finished, and retries can
+create duplicate controls or incident records. We therefore defined a terminal
+receipt contract, treated ambiguous timeouts and 5xx responses as
+`outcome_unknown`, enforced exact remediation grants, and added
+duplicate-resistant DataHub write-back with independent read-back checks.
+
+## What we learned
+
+DataHub becomes more than a catalog when an agent can use it as both governed
+context and durable memory. Lineage and structured properties can constrain
+what the agent is allowed to do; writing verified receipts back gives the next
+operator or agent evidence of what actually happened. We also learned that
+stable idempotency keys make retries safer but do not prove globally atomic
+exactly-once execution, so Aftershock states that boundary explicitly.
+
 ## Technical execution and safety
 
 - Exact immutable grants bind asset, entity type, business action, and endpoint.
@@ -141,3 +159,10 @@ action IDs, incident windows, and coverage evidence for more selective recovery.
 
 Python 3.12, DataHub OSS, DataHub MCP Server, FastMCP, FastAPI, HTTPX, Rich, and
 pytest. The project is open source under Apache License 2.0.
+
+## AI-assistance disclosure
+
+Standard AI coding assistants were used during development to help scaffold,
+test, review, and document the project. The project concept, acceptance
+criteria, architecture decisions, and submission decisions remain under human
+direction and review.
