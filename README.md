@@ -296,12 +296,13 @@ direction and review.
 ## License and submission status
 
 Licensed under the [Apache License 2.0](LICENSE). The
-[public repository](https://github.com/PhantomBugz/aftershock) and GitHub's
-Apache-2.0 license detection were verified on August 4, 2026. The public default
-branch still needs the final reviewed code pushed to it. Publishing the final
-project and video URLs, completing the Devpost form, and checking every
-judge-facing resource while signed out also remain human submission steps; see
-the [submission checklist](docs/submission-checklist.md).
+[public repository](https://github.com/PhantomBugz/aftershock) contains the
+reviewed implementation, setup guide, reproducible examples, captured live
+proof transcript, and DataHub screenshot. GitHub's Apache-2.0 license detection
+was verified on August 4, 2026. Publishing the final project and video URLs,
+completing the Devpost form, and checking every judge-facing resource while
+signed out remain release steps; see the
+[submission checklist](docs/submission-checklist.md).
 
 [mcp]: https://docs.datahub.com/docs/features/feature-guides/mcp
 [properties]: https://docs.datahub.com/docs/api/tutorials/structured-properties
