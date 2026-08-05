@@ -1,5 +1,9 @@
 # Aftershock
 
+- **Project:** <https://aftershock.phantombugz.com>
+- **Demo:** <https://youtu.be/yopSGs_kx5s>
+- **Source:** <https://github.com/PhantomBugz/aftershock>
+
 Aftershock is a DataHub-backed incident-response agent for the **Agents That Do
 Real Work** challenge. It is a deterministic, auditable, policy-driven agent
 loop:

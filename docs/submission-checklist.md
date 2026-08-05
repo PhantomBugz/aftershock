@@ -68,8 +68,10 @@ repository contains supporting files.
 - [ ] Confirm that the submitted project was newly created during the July 6 to
   August 10, 2026 submission period and disclose any pre-existing code or work
   incorporated into it.
-- [ ] Paste the final public repository URL, project/test URL, and publicly
-  visible YouTube, Vimeo, or Youku video URL.
+- [ ] Paste the final URLs into Devpost: project/test
+  <https://aftershock.phantombugz.com>, repository
+  <https://github.com/PhantomBugz/aftershock>, and video
+  <https://youtu.be/yopSGs_kx5s>.
 - [ ] Use the reviewed [Devpost copy](devpost-pitch.md).
 - [ ] Include the AI-assistance disclosure from the README.
 - [ ] Opt in to the feedback section only if desired, and review the
