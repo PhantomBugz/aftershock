@@ -48,7 +48,8 @@ repository contains supporting files.
   2026).
 - [x] Integrate the reviewed feature work into the branch that will be submitted.
 - [x] Push the reviewed submission code to the public default branch. Remote
-  `main` matched the reviewed release worktree on August 5, 2026.
+  `main` includes replay-safe code commit `8082c4b` and matched the reviewed
+  release worktree on August 5, 2026.
 - [x] Confirm the public default branch contains all source, configuration,
   examples, screenshot, proof transcript, and setup instructions.
 - [x] Open the final repository, license, README image, and every documentation

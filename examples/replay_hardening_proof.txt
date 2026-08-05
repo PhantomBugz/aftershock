@@ -2,6 +2,11 @@ AFTERSHOCK REPLAY-HARDENING PROOF
 Date: 2026-08-05 (America/New_York)
 Environment: local DataHub OSS Quickstart v1.6.0, official DataHub MCP server,
 loopback Aftershock demo receiver
+Verified code commit:
+8082c4b514488e1e6a3928f01c1e10d22d01618f
+
+The two live runs below were re-executed consecutively from this clean,
+published commit after it was pushed to the public default branch.
 
 OFFLINE RELEASE GATE
 Command: python -m pytest -q
