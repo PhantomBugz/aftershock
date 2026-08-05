@@ -116,6 +116,12 @@ def _critical_recorder() -> MCPCallRecorder:
             ),
         ],
         save_payload={"success": True, "urn": GENERATED_DOCUMENT_URN},
+        search_payload={
+            "start": 0,
+            "count": 50,
+            "total": 0,
+            "searchResults": [],
+        },
     )
 
 
@@ -208,10 +214,12 @@ def test_critical_envelope_runs_real_mcp_processor_and_returns_report(
     assert set(recorder.events[2:-1]) == {
         "http:/cancel-po",
         "http:/revert-price",
+        "search_documents",
     }
     assert [name for name, _ in recorder.calls] == [
         "get_lineage",
         "get_entities",
+        "search_documents",
         "save_document",
     ]
     assert recorder.calls[0][1]["upstream"] is False

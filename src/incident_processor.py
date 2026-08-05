@@ -58,7 +58,7 @@ class AftershockIncidentProcessor:
     async def process(
         self, incident_id: str, dataset_urn: str
     ) -> IncidentReport:
-        """Discover targets, settle controls, then persist exactly one summary.
+        """Discover targets, settle controls, then persist one summary write.
 
         Discovery errors intentionally propagate before a report is produced.
         A write-back error is instead represented separately so it cannot alter
@@ -85,27 +85,36 @@ class AftershockIncidentProcessor:
         related_assets = list(
             dict.fromkeys([dataset_urn, *(target.urn for target in targets)])
         )
+        record_key = _incident_document_urn(incident_id, dataset_urn)
         content = _render_summary(
             incident_id=incident_id,
             dataset_urn=dataset_urn,
+            record_key=record_key,
             context_mode=self.context.mode,
             timestamp=timestamp,
             receipts=receipts,
         )
+        title = f"Aftershock incident {_single_line(incident_id)}"
 
         self._announce("persist", "saving receipt evidence to DataHub")
         try:
+            existing_urn = await _existing_incident_document_urn(
+                self.context,
+                title=title,
+                dataset_urn=dataset_urn,
+                record_key=record_key,
+            )
             result = await self.context.save_document(
                 document_type="Summary",
-                title=f"Aftershock incident {_single_line(incident_id)}",
+                title=title,
                 content=content,
-                # Omitting the URN is the official create contract. Supplying
-                # a new URN asks DataHub to update a record that does not exist
-                # and is rejected by the server's default update restriction.
-                urn=None,
+                urn=existing_urn,
                 related_assets=related_assets,
             )
-            saved_urn = _saved_document_urn(result)
+            saved_urn = _saved_document_urn(
+                result,
+                expected_urn=existing_urn,
+            )
         except Exception:
             # MCP/server details can contain credentials or response content.
             # Keep the external receipt fixed and log no exception text.
@@ -130,6 +139,106 @@ class AftershockIncidentProcessor:
             receipts=receipts,
             writeback=writeback,
         )
+
+
+async def _existing_incident_document_urn(
+    context: DataHubContextPort,
+    *,
+    title: str,
+    dataset_urn: str,
+    record_key: str,
+) -> str | None:
+    """Find one stable prior write-back for this incident and dataset."""
+
+    payload = await context.search_documents(
+        query=title,
+        num_results=50,
+        offset=0,
+    )
+    search_results = payload.get("searchResults")
+    if not isinstance(search_results, list):
+        raise ValueError("invalid DataHub document search result")
+    total = payload.get("total")
+    if (
+        isinstance(total, int)
+        and not isinstance(total, bool)
+        and total > len(search_results)
+    ):
+        raise ValueError("incomplete DataHub document search result")
+
+    exact_urns: set[str] = set()
+    for result in search_results:
+        if not isinstance(result, Mapping):
+            raise ValueError("invalid DataHub document search result")
+        entity = result.get("entity")
+        if not isinstance(entity, Mapping):
+            raise ValueError("invalid DataHub document search result")
+        info = entity.get("info")
+        result_title = info.get("title") if isinstance(info, Mapping) else None
+        if result_title != title:
+            continue
+        urn = entity.get("urn")
+        if not isinstance(urn, str) or not _DOCUMENT_URN_PATTERN.fullmatch(urn):
+            raise ValueError("invalid DataHub document search result")
+        exact_urns.add(urn)
+
+    if not exact_urns:
+        return None
+
+    ordered_urns = sorted(exact_urns)
+    dataset_marker = f"- Source dataset: {_markdown_value(dataset_urn)}"
+    record_key_marker = f"- Record key: {record_key}"
+    grep_payload = await context.grep_documents(
+        urns=ordered_urns,
+        pattern=(
+            rf"(?m)^(?:{re.escape('- Record key: ')}[^\r\n]+|"
+            rf"{re.escape(dataset_marker)})$"
+        ),
+        context_chars=0,
+        max_matches_per_doc=2,
+        start_offset=0,
+    )
+    grep_results = grep_payload.get("results")
+    if not isinstance(grep_results, list):
+        raise ValueError("invalid DataHub document content result")
+
+    requested_key_urns: set[str] = set()
+    foreign_key_urns: set[str] = set()
+    dataset_urns: set[str] = set()
+    for result in grep_results:
+        if not isinstance(result, Mapping):
+            raise ValueError("invalid DataHub document content result")
+        urn = result.get("urn")
+        matches = result.get("matches")
+        if urn not in exact_urns or not isinstance(matches, list):
+            raise ValueError("invalid DataHub document content result")
+        document_total = result.get("total_matches")
+        if (
+            not isinstance(document_total, int)
+            or isinstance(document_total, bool)
+            or document_total != len(matches)
+        ):
+            raise ValueError("truncated DataHub document content result")
+        for match in matches:
+            if not isinstance(match, Mapping):
+                raise ValueError("invalid DataHub document content result")
+            excerpt = match.get("excerpt")
+            if not isinstance(excerpt, str):
+                raise ValueError("invalid DataHub document content result")
+            if record_key_marker in excerpt:
+                requested_key_urns.add(urn)
+            elif "- Record key:" in excerpt:
+                foreign_key_urns.add(urn)
+            elif dataset_marker in excerpt:
+                dataset_urns.add(urn)
+            else:
+                raise ValueError("invalid DataHub document content result")
+
+    keyed_urns = requested_key_urns - foreign_key_urns
+    if keyed_urns:
+        return min(keyed_urns)
+    legacy_urns = dataset_urns - requested_key_urns - foreign_key_urns
+    return min(legacy_urns) if legacy_urns else None
 
 
 def _utc_timestamp(observed: datetime) -> str:
@@ -211,6 +320,7 @@ def _render_summary(
     *,
     incident_id: str,
     dataset_urn: str,
+    record_key: str,
     context_mode: str,
     timestamp: str,
     receipts: tuple[RemediationReceipt, ...],
@@ -220,6 +330,7 @@ def _render_summary(
         "",
         f"- Incident ID: {_markdown_value(incident_id)}",
         f"- Source dataset: {_markdown_value(dataset_urn)}",
+        f"- Record key: {_markdown_value(record_key)}",
         f"- Context mode: {_markdown_value(context_mode)}",
         f"- Timestamp (UTC): {_markdown_value(timestamp)}",
         "",

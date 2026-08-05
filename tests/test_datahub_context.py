@@ -805,6 +805,70 @@ def test_fixture_context_reads_lineage_entities_and_records_writeback() -> None:
     )
 
 
+def test_fixture_document_update_replaces_one_searchable_record() -> None:
+    context = FixtureDataHubContext(FIXTURE_PATH)
+
+    asyncio.run(
+        context.save_document(
+            document_type="Summary",
+            title="Aftershock incident INC-REPLAY",
+            content="Source dataset: first version",
+            urn=DOCUMENT_URN,
+            related_assets=[DATASET_URN],
+        )
+    )
+    asyncio.run(
+        context.save_document(
+            document_type="Summary",
+            title="Aftershock incident INC-REPLAY",
+            content="Source dataset: updated version",
+            urn=DOCUMENT_URN,
+            related_assets=[DATASET_URN],
+        )
+    )
+
+    search_result = asyncio.run(
+        context.search_documents(query="Aftershock incident INC-REPLAY")
+    )
+    grep_result = asyncio.run(
+        context.grep_documents(urns=[DOCUMENT_URN], pattern="updated version")
+    )
+    dataset = asyncio.run(context.get_entities([DATASET_URN]))[0]
+
+    assert len(context.saved_documents) == 2
+    assert search_result["total"] == 1
+    assert len(search_result["searchResults"]) == 1
+    assert grep_result["documents_with_matches"] == 1
+    assert dataset["relatedDocuments"]["total"] == 1
+
+
+def test_fixture_new_documents_receive_distinct_deterministic_urns() -> None:
+    context = FixtureDataHubContext(FIXTURE_PATH)
+
+    first = asyncio.run(
+        context.save_document(
+            document_type="Summary",
+            title="Aftershock incident INC-FIRST",
+            content="first incident",
+            urn=None,
+            related_assets=[DATASET_URN],
+        )
+    )
+    second = asyncio.run(
+        context.save_document(
+            document_type="Summary",
+            title="Aftershock incident INC-SECOND",
+            content="second incident",
+            urn=None,
+            related_assets=[DATASET_URN],
+        )
+    )
+
+    assert first["urn"] == "urn:li:document:aftershock-fixture"
+    assert second["urn"] == "urn:li:document:aftershock-fixture-2"
+    assert first["urn"] != second["urn"]
+
+
 def test_mode_factory_requires_an_explicit_valid_mode(monkeypatch) -> None:
     monkeypatch.delenv("AFTERSHOCK_DATAHUB_MODE", raising=False)
     with pytest.raises(DataHubConfigurationError):

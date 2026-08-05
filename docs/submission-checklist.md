@@ -11,8 +11,10 @@ repository contains supporting files.
 
 - [x] On August 4, 2026, ran `python -m pytest -q`: `309 passed, 1 skipped`.
   The skip was the expected opt-in live test.
+- [x] On August 5, 2026, reran the hardened release suite: `320 passed, 1
+  skipped`. The skip remained the expected opt-in live test.
 - [x] On August 4, 2026, enabled and ran the live MCP contract against local
-  DataHub OSS Quickstart v1.6.0: `1 passed in 27.59s`.
+  DataHub OSS Quickstart v1.6.0: `1 passed`.
 - [x] On August 4, 2026, completed the live judge demo with the built-in receiver
   and real MCP:
   receiver BEFORE `PO-AFTERSHOCK-001=issued`/`apply_count=0`; ordered
@@ -21,6 +23,12 @@ repository contains supporting files.
   successful DataHub document;
   `search_documents`, `grep_documents`, and both related-asset backlinks
   verified. See the [live proof transcript](../examples/live_demo_proof.txt).
+- [x] On August 5, 2026, ran two consecutive real MCP demonstrations after the
+  replay fix. Both updated
+  `urn:li:document:shared-015c94ed-69c0-40a6-a851-ce76a4920616`, passed the
+  three read-back gates, and left the exact-title record count unchanged at
+  five. See the
+  [replay-hardening proof](../examples/replay_hardening_proof.txt).
 - [x] On August 4, 2026, ran `python -m compileall -q src scripts tests` against
   the frozen submission tree.
 - [x] On August 4, 2026, ran the fixture dashboard and regenerated the
@@ -39,8 +47,8 @@ repository contains supporting files.
 - [x] GitHub detects the repository license as Apache-2.0 (verified August 4,
   2026).
 - [x] Integrate the reviewed feature work into the branch that will be submitted.
-- [x] Push the final submission code to the public default branch. Remote
-  `main` resolved to release commit `a38f18b` on August 5, 2026.
+- [x] Push the reviewed submission code to the public default branch. Remote
+  `main` matched the reviewed release worktree on August 5, 2026.
 - [x] Confirm the public default branch contains all source, configuration,
   examples, screenshot, proof transcript, and setup instructions.
 - [x] Open the final repository, license, README image, and every documentation

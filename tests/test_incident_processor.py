@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import unicodedata
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timezone
@@ -9,8 +10,17 @@ import httpx
 import pytest
 
 from compensating_action_engine import CompensatingActionEngine, RemediationGrant
-from datahub_context import DataHubMCPError, MCPDataHubContext
-from incident_processor import AftershockIncidentProcessor, _single_line
+from datahub_context import (
+    DataHubMCPError,
+    FixtureDataHubContext,
+    MCPDataHubContext,
+)
+from incident_processor import (
+    AftershockIncidentProcessor,
+    _existing_incident_document_urn,
+    _incident_document_urn,
+    _single_line,
+)
 from remediation_models import IncidentReport, WriteBackReceipt
 from mcp_test_server import (
     DATASET_URN,
@@ -101,6 +111,12 @@ def _recorder_with_mixed_targets() -> MCPCallRecorder:
             "urn": DOCUMENT_RESULT_URN,
             "message": "saved",
             "author": "urn:li:corpuser:test",
+        },
+        search_payload={
+            "start": 0,
+            "count": 50,
+            "total": 0,
+            "searchResults": [],
         },
     )
 
@@ -268,10 +284,12 @@ def test_processes_mixed_controls_then_writes_one_complete_mcp_summary() -> None
     assert recorder.events[2:-1] == [
         "http:/succeed",
         "http:/fail",
+        "search_documents",
     ]
     assert [name for name, _ in recorder.calls] == [
         "get_lineage",
         "get_entities",
+        "search_documents",
         "save_document",
     ]
 
@@ -368,6 +386,274 @@ def test_processes_mixed_controls_then_writes_one_complete_mcp_summary() -> None
         report.writeback.status = "failed"  # type: ignore[misc]
 
 
+def test_replay_reuses_one_matching_document_when_legacy_duplicates_exist() -> None:
+    recorder = _recorder_with_mixed_targets()
+    canonical_urn = "urn:li:document:shared-aftershock-legacy-a"
+    duplicate_urn = "urn:li:document:shared-aftershock-legacy-z"
+    title = "Aftershock incident INC-9942"
+    recorder.search_payload = {
+        "start": 0,
+        "count": 50,
+        "total": 2,
+        "searchResults": [
+            {
+                "entity": {
+                    "urn": duplicate_urn,
+                    "subType": "Summary",
+                    "info": {"title": title},
+                }
+            },
+            {
+                "entity": {
+                    "urn": canonical_urn,
+                    "subType": "Summary",
+                    "info": {"title": title},
+                }
+            },
+        ],
+    }
+    recorder.grep_payload = {
+        "results": [
+            {
+                "urn": duplicate_urn,
+                "title": title,
+                "matches": [
+                    {"excerpt": f"- Source dataset: {DATASET_URN}", "position": 0}
+                ],
+                "total_matches": 1,
+            },
+            {
+                "urn": canonical_urn,
+                "title": title,
+                "matches": [
+                    {"excerpt": f"- Source dataset: {DATASET_URN}", "position": 0}
+                ],
+                "total_matches": 1,
+            },
+        ],
+        "total_matches": 2,
+        "documents_with_matches": 2,
+    }
+    recorder.save_payload = {"success": True, "urn": canonical_urn}
+    recorder.echo_saved_urn = True
+
+    def terminal(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "receipt_version": 1,
+                "status": "succeeded",
+                "receipt_id": "replayed-receipt",
+            },
+        )
+
+    report = _run_processor(recorder, terminal)
+
+    assert [name for name, _ in recorder.calls] == [
+        "get_lineage",
+        "get_entities",
+        "search_documents",
+        "grep_documents",
+        "save_document",
+    ]
+    search_arguments = recorder.calls[2][1]
+    assert search_arguments == {"query": title, "num_results": 50, "offset": 0}
+    grep_arguments = recorder.calls[3][1]
+    assert grep_arguments["urns"] == [canonical_urn, duplicate_urn]
+    assert grep_arguments["pattern"] == (
+        rf"(?m)^(?:{re.escape('- Record key: ')}[^\r\n]+|"
+        f"{re.escape(f'- Source dataset: {DATASET_URN}')})$"
+    )
+    assert recorder.calls[4][1]["urn"] == canonical_urn
+    assert report.writeback == WriteBackReceipt(
+        status="succeeded",
+        document_urn=canonical_urn,
+        error=None,
+    )
+
+
+def test_replay_prefers_exact_record_key_over_legacy_dataset_match() -> None:
+    recorder = _recorder_with_mixed_targets()
+    legacy_urn = "urn:li:document:shared-aftershock-a-legacy"
+    keyed_urn = "urn:li:document:shared-aftershock-z-keyed"
+    title = "Aftershock incident INC-9942"
+    record_key = _incident_document_urn("INC-9942", DATASET_URN)
+    recorder.search_payload = {
+        "start": 0,
+        "count": 50,
+        "total": 2,
+        "searchResults": [
+            {"entity": {"urn": legacy_urn, "info": {"title": title}}},
+            {"entity": {"urn": keyed_urn, "info": {"title": title}}},
+        ],
+    }
+    recorder.grep_payload = {
+        "results": [
+            {
+                "urn": legacy_urn,
+                "title": title,
+                "matches": [
+                    {"excerpt": f"- Source dataset: {DATASET_URN}", "position": 0}
+                ],
+                "total_matches": 1,
+            },
+            {
+                "urn": keyed_urn,
+                "title": title,
+                "matches": [
+                    {"excerpt": f"- Record key: {record_key}", "position": 0}
+                ],
+                "total_matches": 1,
+            },
+        ],
+        "total_matches": 2,
+        "documents_with_matches": 2,
+    }
+    recorder.save_payload = {"success": True, "urn": keyed_urn}
+    recorder.echo_saved_urn = True
+
+    def terminal(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "receipt_version": 1,
+                "status": "succeeded",
+                "receipt_id": "keyed-replay-receipt",
+            },
+        )
+
+    report = _run_processor(recorder, terminal)
+
+    assert recorder.calls[-1][1]["urn"] == keyed_urn
+    assert report.writeback.document_urn == keyed_urn
+    assert record_key in recorder.calls[-1][1]["content"]
+
+
+def test_record_key_wins_when_dataset_marker_appears_first_in_content() -> None:
+    context = FixtureDataHubContext()
+    title = "Aftershock incident INC-9942"
+    record_key = _incident_document_urn("INC-9942", DATASET_URN)
+    legacy_urn = "urn:li:document:shared-aftershock-a-legacy"
+    keyed_urn = "urn:li:document:shared-aftershock-z-keyed"
+
+    async def scenario() -> str | None:
+        await context.save_document(
+            document_type="Summary",
+            title=title,
+            content=f"- Source dataset: {DATASET_URN}\n",
+            urn=legacy_urn,
+            related_assets=[DATASET_URN],
+        )
+        await context.save_document(
+            document_type="Summary",
+            title=title,
+            content=(
+                f"- Source dataset: {DATASET_URN}\n"
+                f"- Record key: {record_key}\n"
+            ),
+            urn=keyed_urn,
+            related_assets=[DATASET_URN],
+        )
+        return await _existing_incident_document_urn(
+            context,
+            title=title,
+            dataset_urn=DATASET_URN,
+            record_key=record_key,
+        )
+
+    assert asyncio.run(scenario()) == keyed_urn
+
+
+def test_foreign_record_key_is_never_adopted_as_a_legacy_match() -> None:
+    context = FixtureDataHubContext()
+    requested_incident = "INC 42"
+    foreign_incident = "INC  42"
+    title = f"Aftershock incident {_single_line(requested_incident)}"
+    requested_key = _incident_document_urn(requested_incident, DATASET_URN)
+    foreign_key = _incident_document_urn(foreign_incident, DATASET_URN)
+    foreign_urn = "urn:li:document:shared-aftershock-foreign-key"
+    assert requested_key != foreign_key
+
+    async def scenario() -> str | None:
+        await context.save_document(
+            document_type="Summary",
+            title=title,
+            content=(
+                f"- Source dataset: {DATASET_URN}\n"
+                f"- Record key: {foreign_key}\n"
+            ),
+            urn=foreign_urn,
+            related_assets=[DATASET_URN],
+        )
+        return await _existing_incident_document_urn(
+            context,
+            title=title,
+            dataset_urn=DATASET_URN,
+            record_key=requested_key,
+        )
+
+    assert asyncio.run(scenario()) is None
+
+
+def test_incident_text_cannot_mask_the_generated_record_key_match() -> None:
+    context = FixtureDataHubContext()
+    incident_id = "INC Record key: attacker-controlled"
+    title = f"Aftershock incident {_single_line(incident_id)}"
+    record_key = _incident_document_urn(incident_id, DATASET_URN)
+    keyed_urn = "urn:li:document:shared-aftershock-injection-safe"
+
+    async def scenario() -> str | None:
+        await context.save_document(
+            document_type="Summary",
+            title=title,
+            content=(
+                f"- Incident ID: {incident_id}\n"
+                f"- Source dataset: {DATASET_URN}\n"
+                f"- Record key: {record_key}\n"
+            ),
+            urn=keyed_urn,
+            related_assets=[DATASET_URN],
+        )
+        return await _existing_incident_document_urn(
+            context,
+            title=title,
+            dataset_urn=DATASET_URN,
+            record_key=record_key,
+        )
+
+    assert asyncio.run(scenario()) == keyed_urn
+
+
+def test_truncated_record_identity_evidence_fails_closed() -> None:
+    context = FixtureDataHubContext()
+    title = "Aftershock incident INC-9942"
+    record_key = _incident_document_urn("INC-9942", DATASET_URN)
+    poisoned_urn = "urn:li:document:shared-aftershock-poisoned"
+
+    async def scenario() -> str | None:
+        await context.save_document(
+            document_type="Summary",
+            title=title,
+            content=(
+                f"- Source dataset: {DATASET_URN}\n"
+                f"- Record key: {record_key}\n"
+                "- Record key: urn:li:document:aftershock-incident-foreign-"
+                "00000000000000000000000000000000\n"
+            ),
+            urn=poisoned_urn,
+            related_assets=[DATASET_URN],
+        )
+        return await _existing_incident_document_urn(
+            context,
+            title=title,
+            dataset_urn=DATASET_URN,
+            record_key=record_key,
+        )
+
+    with pytest.raises(ValueError, match="content result"):
+        asyncio.run(scenario())
+
+
 def test_zero_target_incidents_create_documents_without_forcing_update_urns() -> None:
     recorder = MCPCallRecorder(
         lineage_pages={
@@ -382,6 +668,12 @@ def test_zero_target_incidents_create_documents_without_forcing_update_urns() ->
             }
         },
         save_payload={"success": True, "urn": DOCUMENT_RESULT_URN},
+        search_payload={
+            "start": 0,
+            "count": 50,
+            "total": 0,
+            "searchResults": [],
+        },
     )
 
     async def handler(_: httpx.Request) -> httpx.Response:
@@ -475,6 +767,112 @@ def test_writeback_failures_are_secret_safe_and_preserve_control_receipts(
     assert "writeback-secret" not in serialized
     assert "super-secret-value" not in serialized
     assert recorder.events[-1] == "save_document"
+
+
+@pytest.mark.parametrize("fail_tool", ["search_documents", "grep_documents"])
+def test_replay_lookup_failure_never_falls_back_to_document_create(
+    fail_tool: str,
+) -> None:
+    recorder = _recorder_with_mixed_targets()
+    title = "Aftershock incident INC-9942"
+    existing_urn = "urn:li:document:shared-aftershock-existing"
+    recorder.search_payload = {
+        "start": 0,
+        "count": 50,
+        "total": 1,
+        "searchResults": [
+            {"entity": {"urn": existing_urn, "info": {"title": title}}}
+        ],
+    }
+    recorder.grep_payload = {
+        "results": [
+            {
+                "urn": existing_urn,
+                "title": title,
+                "matches": [
+                    {"excerpt": f"- Source dataset: {DATASET_URN}", "position": 0}
+                ],
+                "total_matches": 1,
+            }
+        ],
+        "total_matches": 1,
+        "documents_with_matches": 1,
+    }
+    recorder.fail_tool = fail_tool
+
+    def terminal(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "receipt_version": 1,
+                "status": "succeeded",
+                "receipt_id": "lookup-failure-receipt",
+            },
+        )
+
+    report = _run_processor(recorder, terminal)
+
+    assert report.receipts[0].status == "succeeded"
+    assert report.writeback == WriteBackReceipt(
+        status="failed",
+        document_urn=None,
+        error=WRITEBACK_ERROR,
+    )
+    assert all(name != "save_document" for name, _ in recorder.calls)
+
+
+def test_update_returning_different_urn_never_retries_as_create() -> None:
+    recorder = _recorder_with_mixed_targets()
+    title = "Aftershock incident INC-9942"
+    existing_urn = "urn:li:document:shared-aftershock-existing"
+    recorder.search_payload = {
+        "start": 0,
+        "count": 50,
+        "total": 1,
+        "searchResults": [
+            {"entity": {"urn": existing_urn, "info": {"title": title}}}
+        ],
+    }
+    recorder.grep_payload = {
+        "results": [
+            {
+                "urn": existing_urn,
+                "title": title,
+                "matches": [
+                    {"excerpt": f"- Source dataset: {DATASET_URN}", "position": 0}
+                ],
+                "total_matches": 1,
+            }
+        ],
+        "total_matches": 1,
+        "documents_with_matches": 1,
+    }
+    recorder.save_payload = {
+        "success": True,
+        "urn": "urn:li:document:server-returned-different",
+    }
+    recorder.echo_saved_urn = False
+
+    def terminal(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "receipt_version": 1,
+                "status": "succeeded",
+                "receipt_id": "mismatched-update-receipt",
+            },
+        )
+
+    report = _run_processor(recorder, terminal)
+
+    save_calls = [args for name, args in recorder.calls if name == "save_document"]
+    assert save_calls == [recorder.calls[-1][1]]
+    assert save_calls[0]["urn"] == existing_urn
+    assert report.writeback == WriteBackReceipt(
+        status="failed",
+        document_urn=None,
+        error=WRITEBACK_ERROR,
+    )
 
 
 def test_server_generated_document_urn_is_accepted_for_a_new_document() -> None:

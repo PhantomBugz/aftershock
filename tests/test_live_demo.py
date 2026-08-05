@@ -245,7 +245,12 @@ class _LiveContext(_ReadbackContext):
         return {"success": True, "urn": DOCUMENT_URN}
 
     async def search_documents(self, **kwargs: Any) -> dict[str, Any]:
-        assert self.saved is not None
+        if self.saved is None:
+            return {
+                "searchResults": [],
+                "total": 0,
+                "count": kwargs["num_results"],
+            }
         self.search_title = self.saved["title"]
         return await super().search_documents(**kwargs)
 

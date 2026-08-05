@@ -38,9 +38,11 @@ Aftershock extends DataHub instead of rebuilding its catalog:
 - `get_lineage(upstream=false)` discovers downstream exposure.
 - `get_entities` resolves assets plus the governed structured properties
   `aftershock.businessAction` and `aftershock.remediationWebhook`.
-- `save_document` creates durable incident memory related to the source dataset
-  and downstream job.
-- `search_documents` proves the generated document URN and exact title.
+- `search_documents` locates a verified prior incident record for
+  duplicate-resistant replay.
+- `save_document` creates or updates durable incident memory related to the
+  source dataset and downstream job.
+- post-write `search_documents` proves the returned document URN and exact title.
 - `grep_documents` proves the incident and external receipt IDs were persisted.
 - a second `get_entities` read proves both related assets link back to the saved
   document.
@@ -66,9 +68,15 @@ read-back checks to pass before displaying
 
 On August 4, 2026, the complete OBSERVE/DECIDE/ACT/PERSIST path succeeded. The
 saved record was visible in the local DataHub UI and linked to both the dataset
-and DataJob. A separate opt-in live MCP contract test also passed (`1 passed in
-27.59s`). The deterministic offline suite passed `309` tests with the one live
+and DataJob. A separate opt-in live MCP contract test also passed (`1 passed`).
+The deterministic offline suite passed `309` tests with the one live
 test skipped only when its explicit opt-in was absent.
+
+The August 5 release hardening passes `320` tests with that same opt-in test
+skipped. Two consecutive real MCP runs reused one canonical incident Document,
+kept the existing exact-title record count unchanged, and passed all three
+read-back gates. The receiver idempotency key and DataHub record key are stable
+replay controls, not a claim of globally atomic exactly-once execution.
 
 ## Receipts, not inferred outcomes
 
@@ -79,8 +87,9 @@ A control succeeds only when the receiver returns the strict terminal contract:
 ```
 
 Aftershock distinguishes `succeeded`, `accepted`, `failed`, `skipped`, and
-`outcome_unknown`. HTTP 202 is nonterminal. Ambiguous timeouts and 5xx responses
-remain unknown unless a valid terminal receipt proves the outcome. A stable
+`outcome_unknown`. HTTP 202 is nonterminal unless its body carries a valid v1
+terminal receipt. Ambiguous timeouts and 5xx responses remain unknown unless a
+valid terminal receipt proves the outcome. A stable
 idempotency key supports safe receiver-side replay, while bounded concurrency,
 a workflow deadline, disabled redirects, and a 64 KiB response limit constrain
 execution.

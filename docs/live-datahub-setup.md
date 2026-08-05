@@ -127,11 +127,12 @@ business operation is terminal:
 }
 ```
 
-An HTTP 200 without that contract is `outcome_unknown`; HTTP 202 and v1
-`accepted`/`pending` on ordinary success-class responses are nonterminal
-`accepted`. A 4xx response other than 408 is a failed rejection. HTTP 408 or a
-5xx response is `outcome_unknown` unless it carries a valid v1 terminal
-`succeeded` or `failed` receipt, which Aftershock honors. Network failure or
+An HTTP 200 without that contract is `outcome_unknown`; HTTP 202 without a
+terminal v1 contract, and v1 `accepted`/`pending` on ordinary success-class
+responses, are nonterminal `accepted`. A 4xx response other than 408 is a failed
+rejection. HTTP 408 or a 5xx response is `outcome_unknown` unless it carries a
+valid v1 terminal `succeeded` or `failed` receipt, which Aftershock honors.
+Network failure or
 workflow deadline expiry after dispatch is conservatively `outcome_unknown`;
 work that never dispatches before the deadline is `skipped`. The stable
 `Idempotency-Key` supports receiver-side deduplication but does not prove
@@ -207,14 +208,15 @@ sequence is:
 2. **OBSERVE:** read downstream lineage and entity metadata through MCP.
 3. **DECIDE:** resolve the one metadata-backed remediation target.
 4. **ACT:** require the exact grant and a terminal v1 receipt.
-5. **PERSIST:** create the incident document with MCP `save_document`.
+5. **PERSIST:** create or update the incident document with MCP
+   `save_document` after a verified bounded search.
 6. **RECEIVER AFTER:** `PO-AFTERSHOCK-001=canceled`,
    `issue_po_enabled=False`, `apply_count=1`.
 7. **LIVE DATAHUB READBACK VERIFIED:** all three independent reads pass.
 
 The three read-back checks are intentionally distinct:
 
-- `search_documents` must find the server-generated document URN and exact
+- `search_documents` must find the returned document URN and exact
   title;
 - `grep_documents` must find the incident ID and external receipt ID in the
   saved content; and
@@ -242,7 +244,7 @@ The test creates a uniquely marked document and independently polls
 `search_documents`, `grep_documents`, and both related-asset projections. It
 does not invoke the remediation receiver; `live_demo.py` is the end-to-end
 business-action proof. On August 4, 2026, this test ran rather than skipping and
-passed against the local v1.6.0 instance (`1 passed in 27.59s`). A later skipped
+passed against the local v1.6.0 instance (`1 passed`). A later skipped
 test is not evidence of a later successful live run.
 
 ## Optional: exercise the authenticated listener

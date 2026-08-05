@@ -39,8 +39,9 @@ For a critical Aftershock-normalized incident envelope, the workflow:
    operator-controlled exact remediation grant;
 6. invokes bounded, asynchronous compensating controls and records factual
    receipts; and
-7. calls `save_document` through MCP to persist the incident summary and
-   related asset URNs for the next operator or agent.
+7. finds a verified prior incident Document when one exists, then calls
+   `save_document` through MCP to create or update the summary and related
+   asset URNs for the next operator or agent.
 
 ## DataHub is the foundation
 
@@ -84,8 +85,8 @@ Every target settles into one of five states:
 
 | Status | Meaning |
 | --- | --- |
-| `succeeded` | An eligible non-202 response contained the required v1 terminal `succeeded` contract and a valid external receipt ID. A 408/5xx is honored only when it carries that terminal contract. |
-| `accepted` | The receiver acknowledged work, but no terminal outcome is known. HTTP 202 and accepted/pending contracts on ordinary success-class responses are nonterminal. |
+| `succeeded` | A success-class response contained the required v1 terminal `succeeded` contract and a valid external receipt ID. This includes HTTP 202 only when that explicit terminal contract is present. A 408/5xx is honored only when it carries that terminal contract. |
+| `accepted` | The receiver acknowledged work, but no terminal outcome is known. HTTP 202 without a terminal v1 contract, and accepted/pending contracts on ordinary success-class responses, are nonterminal. |
 | `failed` | The request failed before dispatch, was rejected with a 4xx other than 408, encountered a disabled redirect, or returned a valid v1 terminal failure receipt. |
 | `skipped` | The playbook was incomplete, its exact endpoint was denied, or the workflow deadline expired before dispatch. |
 | `outcome_unknown` | Dispatch may have occurred, but a 408/5xx without a valid terminal receipt, transport failure, deadline expiry, or another invalid/missing terminal response left the outcome unproven. |
@@ -115,6 +116,14 @@ the incident, target, and business action. It is a stable retry key, not proof
 of exactly-once execution. The engine uses at most eight workers and a
 30-second workflow deadline by default. At the deadline, dispatched work is
 conservatively `outcome_unknown`; work not yet dispatched is `skipped`.
+
+DataHub write-back is also duplicate-resistant for sequential replay. Before
+saving, Aftershock performs a bounded exact-title search, verifies a stable
+incident+dataset record key (or the dataset marker on a legacy record), and
+updates the lexically stable matching Document URN. It creates a new Document
+only when no verified match exists, and never falls back to creating one after
+a failed search or update. This is not a claim of globally atomic exactly-once
+persistence across concurrent processes.
 
 ## Governed outbound controls
 
@@ -166,7 +175,7 @@ receipt, confirms the order is `canceled` and further issuance is disabled,
 and requires the DataHub write-back to succeed. It then proves persistence
 through three independent MCP reads:
 
-1. `search_documents` finds the exact generated document URN and title;
+1. `search_documents` finds the exact returned document URN and title;
 2. `grep_documents` finds the incident ID and external receipt ID in content;
 3. `get_entities` finds the saved document in both the dataset and DataJob
    `relatedDocuments` backlinks.
@@ -277,12 +286,19 @@ The MCP server, FastMCP, and DataHub SDK integration dependencies are pinned.
 Offline tests and demo inputs are deterministic. On August 4, 2026, the offline
 suite passed `309` tests with the one opt-in live test skipped as expected. The
 same live test then ran explicitly against local DataHub OSS Quickstart v1.6.0
-and passed (`1 passed in 27.59s`). The final live demonstration also proved the
+and passed (`1 passed`). The final live demonstration also proved the
 purchase-order transition from `issued` to `canceled`, canonical PO-bound
 receipt, MCP `save_document`, searchable content, and both related-asset
 backlinks. A future skipped live test still must not be presented as a new
 successful live result; use the dated
 [proof transcript](examples/live_demo_proof.txt) as the captured evidence.
+
+On August 5, 2026, replay hardening raised the current suite to `320 passed, 1
+skipped`. Two consecutive real MCP demonstrations then updated the same
+canonical Document URN and passed all read-back gates; the five historical
+same-title development records did not increase. See the dated
+[replay-hardening proof](examples/replay_hardening_proof.txt). Historical
+records were preserved rather than destructively removed.
 
 Useful DataHub references:
 

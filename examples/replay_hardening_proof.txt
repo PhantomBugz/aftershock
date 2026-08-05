@@ -1,0 +1,38 @@
+AFTERSHOCK REPLAY-HARDENING PROOF
+Date: 2026-08-05 (America/New_York)
+Environment: local DataHub OSS Quickstart v1.6.0, official DataHub MCP server,
+loopback Aftershock demo receiver
+
+OFFLINE RELEASE GATE
+Command: python -m pytest -q
+Result: 320 passed, 1 skipped in 10.51s
+Expected skip: opt-in live DataHub MCP contract test
+
+LIVE MCP RUN 1
+Result: completed
+Receiver transition: issued -> canceled
+Receiver apply_count: 0 -> 1
+Saved document URN:
+urn:li:document:shared-015c94ed-69c0-40a6-a851-ce76a4920616
+Read-back: search_documents, grep_documents, dataset backlink, and DataJob
+backlink all verified
+
+LIVE MCP RUN 2 (IMMEDIATE REPLAY)
+Result: completed
+Receiver transition after deliberate demo reset: issued -> canceled
+Receiver apply_count: 0 -> 1
+Saved document URN:
+urn:li:document:shared-015c94ed-69c0-40a6-a851-ce76a4920616
+Read-back: search_documents, grep_documents, dataset backlink, and DataJob
+backlink all verified
+
+POST-REPLAY SEARCH
+Exact title: Aftershock incident INC-LIVE-001
+ExactDocumentCount=5
+CanonicalCount=1
+
+Interpretation: both post-fix runs updated the same canonical agent-authored
+Document and did not create a sixth same-title record. Five historical
+development records were preserved rather than deleted. Search-then-update is
+duplicate-resistant for sequential replay; it is not represented as globally
+atomic exactly-once persistence across concurrent processes.

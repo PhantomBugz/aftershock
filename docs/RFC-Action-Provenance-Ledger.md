@@ -127,9 +127,10 @@ they are not collapsed into a synthetic success. Ledger persistence failure
 does not relabel an already observed external control result.
 
 The current Aftershock v1 receiver contract supplies a concrete baseline for
-the ledger. A terminal success requires an eligible non-202 response containing
+the ledger. A terminal success requires an eligible response containing
 `receipt_version: 1`, `status: succeeded`, and a valid external `receipt_id`.
-`accepted` and `pending` are nonterminal on ordinary success-class responses.
+HTTP 202 without that terminal contract, plus `accepted` and `pending` on
+ordinary success-class responses, are nonterminal.
 A 4xx other than 408 is a failed rejection. HTTP 408 and 5xx are
 `outcome_unknown` unless they carry a valid v1 terminal success/failure receipt,
 which is honored. Transport failure after dispatch, deadline expiry after

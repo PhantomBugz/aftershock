@@ -48,3 +48,8 @@ local DataHub OSS Quickstart v1.6.0 instance. It records:
 
 This file proves the named local run; it does not claim a hosted DataHub service
 or a future rerun. `src/live_demo.py` remains the executable proof gate.
+
+[`replay_hardening_proof.txt`](replay_hardening_proof.txt) records the August 5,
+2026 release verification after duplicate-resistant write-back was added. It
+captures the current test count, the canonical Document URN returned by two
+consecutive real MCP runs, and the unchanged exact-title document count.

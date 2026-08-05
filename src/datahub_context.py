@@ -661,6 +661,7 @@ class FixtureDataHubContext:
         self._fixture = json.loads(self.fixture_path.read_text(encoding="utf-8"))
         self.saved_documents: list[dict[str, Any]] = []
         self._saved_document_records: list[dict[str, Any]] = []
+        self._created_document_count = 0
 
     def _dataset(self) -> Mapping[str, Any] | None:
         data = self._fixture.get("data")
@@ -874,7 +875,16 @@ class FixtureDataHubContext:
     ) -> dict[str, Any]:
         """Record a write-back call in memory and return a fixture receipt."""
 
-        resolved_urn = urn or "urn:li:document:aftershock-fixture"
+        if urn is None:
+            self._created_document_count += 1
+            suffix = (
+                ""
+                if self._created_document_count == 1
+                else f"-{self._created_document_count}"
+            )
+            resolved_urn = f"urn:li:document:aftershock-fixture{suffix}"
+        else:
+            resolved_urn = urn
         self.saved_documents.append(
             {
                 "document_type": document_type,
@@ -884,15 +894,22 @@ class FixtureDataHubContext:
                 "related_assets": list(related_assets),
             }
         )
-        self._saved_document_records.append(
-            {
-                "document_type": document_type,
-                "title": title,
-                "content": content,
-                "urn": resolved_urn,
-                "related_assets": list(related_assets),
-            }
-        )
+        record = {
+            "document_type": document_type,
+            "title": title,
+            "content": content,
+            "urn": resolved_urn,
+            "related_assets": list(related_assets),
+        }
+        if urn is None:
+            self._saved_document_records.append(record)
+        else:
+            for index, existing in enumerate(self._saved_document_records):
+                if existing["urn"] == resolved_urn:
+                    self._saved_document_records[index] = record
+                    break
+            else:
+                self._saved_document_records.append(record)
         return {
             "success": True,
             "urn": resolved_urn,

@@ -95,7 +95,7 @@ DataHub context.”
 ## 2:25–2:39 — Technical quality
 
 **On screen:** show captured terminal results from the final verification:
-`309 passed, 1 skipped` for the offline suite and `1 passed in 27.59s` for the
+`309 passed, 1 skipped` for the offline suite and `1 passed` for the
 separately enabled live MCP test. Briefly show the public repository and
 Apache-2.0 license badge after the final code has been pushed.
 
